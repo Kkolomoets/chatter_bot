@@ -1,0 +1,42 @@
+[
+  {
+    "profileId": "pd-100665530",
+    "customer": {
+      "id": "109285428",
+      "name": "Tony",
+      "photo": "https://i.gstatvb.com/shpzkl6l7hv4slj9m.r100x100.db13dc48.jpg",
+      "gender": "male",
+      "language": "en"
+    },
+    "source": "CUSTOMER",
+    "type": "LIKE_PHOTO",
+    "content": {
+      "idPhoto": 1051458856,
+      "url": "https://i.gstatvb.com/shpzkl36ufl9e4g9i.r300x300.13e8aac2.jpg",
+      "photos": [],
+      "videos": []
+    },
+    "createdDate": "2026-03-02T17:43:40Z",
+    "paidAction": false
+  },
+  {
+    "profileId": "pd-100665531",
+    "customer": {
+      "id": "109285428",
+      "name": "Tony",
+      "photo": "https://i.gstatvb.com/shpzkl6l7hv4slj9m.r100x100.db13dc48.jpg",
+      "gender": "male",
+      "language": "en"
+    },
+    "source": "CUSTOMER",
+    "type": "LIKE_PHOTO",
+    "content": {
+      "idPhoto": 1051458856,
+      "url": "https://i.gstatvb.com/shpzkl36ufl9e4g9i.r300x300.13e8aac2.jpg",
+      "photos": [],
+      "videos": []
+    },
+    "createdDate": "2026-03-02T17:43:40Z",
+    "paidAction": false
+  }
+]
