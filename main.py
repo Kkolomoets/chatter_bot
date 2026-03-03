@@ -275,7 +275,7 @@ def format_user_alert(user: dict, name_id: dict) -> str:
         f"📋 Анкета: {girl_name}\n"
         f"💬 Сообщений доступно: {user['messagesLeft']}"
         f"{idle}"
-        f"{important}"
+        f"\n{important}"
     )
 
 
