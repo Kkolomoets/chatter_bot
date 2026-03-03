@@ -228,7 +228,7 @@ async def check_online_inactive(
                         user["createdDate"], "%Y-%m-%dT%H:%M:%SZ"
                     )
                     if (
-                        datetime.now() - created > timedelta(hours=1)
+                        datetime.now() - created > timedelta(hours=2)
                         and user["messagesLeft"] > 0
                     ):
                         found.append(
