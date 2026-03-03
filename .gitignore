@@ -3,3 +3,4 @@ debug/
 .venv
 test*.py
 *.json
+old*
