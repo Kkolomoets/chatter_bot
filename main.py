@@ -43,7 +43,7 @@ BEARER_MIN_REFRESH_INTERVAL = timedelta(hours=1)
 NEWSFEED_INTERVAL = timedelta(hours=12)
 SHIFT_DURATION = timedelta(hours=8)
 NEWSFEED_WARN_BEFORE = timedelta(minutes=0)  # уведомлять когда истекло
-NEWSFEED_CHECK_INTERVAL = 300  # секунд между проверками newsfeed
+NEWSFEED_CHECK_INTERVAL = 30  # секунд между проверками newsfeed
 
 DEDUP_WINDOW = timedelta(minutes=8)  # антидубль: не повторять пару (girl_id, user_id)
 SNOOZE_OPTIONS = [  # варианты игнора (секунды, метка)
@@ -468,6 +468,73 @@ async def check_offline_unanswered(
     return found
 
 
+# ======================== СМЕНА ========================
+WORK_SHIFT_ID = 4980
+
+
+async def get_profile_emails(session: aiohttp.ClientSession, bearer: str) -> dict:
+    """
+    GET /balance/profile → возвращает словарь {girl_id: email}.
+    girl_id здесь без префикса pd-.
+    """
+    url = f"{BASE_URL}/balance/profile"
+    data = await api_get(session, url, bearer)
+    if not data:
+        return {}
+    result = {}
+    for item in data.get("balances", []):
+        profile_id = item.get("profileId", "").replace("pd-", "")
+        email = item.get("email", "")
+        if profile_id and email:
+            result[profile_id] = email
+    return result
+
+
+async def set_shift_for_profile(
+    session: aiohttp.ClientSession,
+    bearer: str,
+    girl_id: str,
+    name: str,
+    email: str,
+) -> bool:
+    """
+    PATCH /identity/profiles/pd-{girl_id}
+    Сначала GET чтобы забрать текущие поля профиля (scope и др.),
+    потом PATCH с полным объектом — только workShiftId меняем.
+    """
+    url = f"{BASE_URL}/identity/profiles/pd-{girl_id}"
+    headers = {
+        **_API_HEADERS_BASE,
+        "Authorization": f"Bearer {bearer}",
+        "Content-Type": "application/json",
+    }
+
+    # Шаг 1: получаем текущий профиль
+    current = await api_get(session, url, bearer)
+    if current is None:
+        logger.error(f"set_shift: не удалось получить профиль {girl_id}")
+        return False
+
+    # Шаг 2: берём текущий объект и меняем только нужные поля
+    payload = {**current, "name": name, "email": email, "workShiftId": WORK_SHIFT_ID}
+
+    try:
+        async with session.patch(
+            url,
+            headers=headers,
+            json=payload,
+            ssl=False,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status not in (200, 204):
+                logger.error(f"set_shift error {resp.status} for {girl_id}")
+                return False
+            return True
+    except Exception as e:
+        logger.error(f"set_shift exception for {girl_id}: {e}")
+        return False
+
+
 # ======================== NEWSFEED ========================
 async def get_newsfeed_statuses(session: aiohttp.ClientSession, bearer: str) -> list:
     """Возвращает сырой список статусов newsfeed."""
@@ -617,13 +684,13 @@ def admin_keyboard(user_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="📰 Newsfeed", callback_data=f"check_newsfeed_{user_id}"
+                    text="🎚 Управление мониторингом",
+                    callback_data=f"monitors_{user_id}",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="🎚 Управление мониторингом",
-                    callback_data=f"monitors_{user_id}",
+                    text="🗓 Управление сменой", callback_data=f"shift_panel_{user_id}"
                 ),
             ],
             [
@@ -667,6 +734,47 @@ def monitors_keyboard(user_id: int) -> InlineKeyboardMarkup:
                     text="◀️ Назад", callback_data=f"back_panel_{user_id}"
                 )
             ],
+        ]
+    )
+
+
+def shift_panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Подпанель управления сменой."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📰 Newsfeed",
+                    callback_data=f"check_newsfeed_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⏰ Выставить смену (15:00–23:00)",
+                    callback_data=f"shift_set_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Назад", callback_data=f"back_panel_{user_id}"
+                )
+            ],
+        ]
+    )
+
+
+def shift_confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура подтверждения выставления смены."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить", callback_data=f"shift_confirm_{user_id}"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена", callback_data=f"shift_panel_{user_id}"
+                ),
+            ]
         ]
     )
 
@@ -1406,6 +1514,142 @@ async def cb_check_online(callback: CallbackQuery):
             )
     else:
         await callback.message.answer("✅ Онлайн-пользователей без ответа нет.")
+
+
+# ======================== CALLBACK: ПОДПАНЕЛЬ СМЕНЫ ========================
+@dp.callback_query(F.data.startswith("shift_panel_"))
+async def cb_shift_panel(callback: CallbackQuery):
+    uid = int(callback.data.split("_")[2])
+    if callback.from_user.id != uid:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🗓 <b>Управление сменой</b>",
+        parse_mode="HTML",
+        reply_markup=shift_panel_keyboard(uid),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("shift_set_"))
+async def cb_shift_set(callback: CallbackQuery):
+    """Показывает список анкет и просит подтвердить выставление смены."""
+    uid = int(callback.data.split("_")[2])
+    if callback.from_user.id != uid:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    sess = user_sessions.get(uid)
+    if not sess:
+        await callback.answer("❌ Нет сессии", show_alert=True)
+        return
+
+    list_of_id = sess.get("list_of_id", [])
+    name_id = sess.get("name_id", {})
+
+    if not list_of_id:
+        await callback.answer(
+            "❌ Анкеты не загружены. Сначала запусти мониторинг.", show_alert=True
+        )
+        return
+
+    await callback.answer("📋 Загружаю список анкет...")
+
+    # Получаем email'ы и сохраняем в сессии
+    async with aiohttp.ClientSession() as http:
+        emails = await get_profile_emails(http, sess["bearer"])
+
+    sess["profile_emails"] = (
+        emails  # кэшируем, чтобы не запрашивать повторно при confirm
+    )
+
+    lines = ["⏰ <b>Выставить смену (15:00–23:00) для анкет:</b>\n"]
+    missing = []
+    for gid in list_of_id:
+        name = name_id.get(gid, gid)
+        email = emails.get(gid)
+        if email:
+            lines.append(f"✅ {name}")
+        else:
+            lines.append(f"⚠️ {name} — email не найден, будет пропущена")
+            missing.append(name)
+
+    if missing:
+        lines.append(
+            f"\n⚠️ {len(missing)} анкет будут пропущены из-за отсутствия email."
+        )
+
+    lines.append("\nПодтвердить?")
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=shift_confirm_keyboard(uid),
+    )
+
+
+@dp.callback_query(F.data.startswith("shift_confirm_"))
+async def cb_shift_confirm(callback: CallbackQuery):
+    """Выставляет смену для всех анкет."""
+    uid = int(callback.data.split("_")[2])
+    if callback.from_user.id != uid:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    sess = user_sessions.get(uid)
+    if not sess:
+        await callback.answer("❌ Нет сессии", show_alert=True)
+        return
+
+    list_of_id = sess.get("list_of_id", [])
+    name_id = sess.get("name_id", {})
+    emails = sess.get("profile_emails", {})
+    bearer = sess["bearer"]
+
+    await callback.answer("⏳ Выставляю смену...")
+    await callback.message.edit_text(
+        "⏳ Выставляю смену для всех анкет...", parse_mode="HTML"
+    )
+
+    ok, failed, skipped = [], [], []
+
+    async with aiohttp.ClientSession() as http:
+        for gid in list_of_id:
+            name = name_id.get(gid, gid)
+            email = emails.get(gid)
+            if not email:
+                skipped.append(name)
+                continue
+            success = await set_shift_for_profile(http, bearer, gid, name, email)
+            if success:
+                ok.append(name)
+            else:
+                failed.append(name)
+            await asyncio.sleep(0.3)  # небольшая пауза между запросами
+
+    lines = ["🗓 <b>Результат выставления смены:</b>\n"]
+    for name in ok:
+        lines.append(f"✅ {name}")
+    for name in failed:
+        lines.append(f"❌ {name} — ошибка запроса")
+    for name in skipped:
+        lines.append(f"⚠️ {name} — нет email, пропущена")
+
+    lines.append(
+        f"\n<b>Итого:</b> {len(ok)} успешно, {len(failed)} ошибок, {len(skipped)} пропущено"
+    )
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="◀️ Назад", callback_data=f"shift_panel_{uid}"
+                    )
+                ]
+            ]
+        ),
+    )
 
 
 @dp.callback_query(F.data.startswith("check_newsfeed_"))
