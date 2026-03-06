@@ -43,10 +43,13 @@ BEARER_MIN_REFRESH_INTERVAL = timedelta(hours=1)
 NEWSFEED_INTERVAL = timedelta(hours=12)
 SHIFT_DURATION = timedelta(hours=8)
 NEWSFEED_WARN_BEFORE = timedelta(minutes=0)  # уведомлять когда истекло
-NEWSFEED_CHECK_INTERVAL = 30                  # секунд между проверками newsfeed
+NEWSFEED_CHECK_INTERVAL = 30  # секунд между проверками newsfeed
 
-DEDUP_WINDOW = timedelta(minutes=8)           # антидубль: не повторять пару (girl_id, user_id)
-SNOOZE_OPTIONS = [                            # варианты игнора (секунды, метка)
+IB_INTERVAL = timedelta(hours=6)  # icebreakers: порог устаревания
+IB_CHECK_INTERVAL = 30 * 60  # секунд между проверками icebreakers (30 мин)
+
+DEDUP_WINDOW = timedelta(minutes=8)  # антидубль: не повторять пару (girl_id, user_id)
+SNOOZE_OPTIONS = [  # варианты игнора (секунды, метка)
     (15 * 60, "15м"),
     (30 * 60, "30м"),
     (60 * 60, "1ч"),
@@ -95,7 +98,8 @@ def save_sessions():
             "credentials": sess.get("credentials"),  # {"login": ..., "password": ...}
             "bearer_expires_at": (
                 sess["bearer_expires_at"].isoformat()
-                if sess.get("bearer_expires_at") else None
+                if sess.get("bearer_expires_at")
+                else None
             ),
         }
     with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
@@ -120,7 +124,9 @@ def _parse_api_dt(dt_str: str) -> datetime:
 
 def _parse_newsfeed_dt(dt_str: str) -> datetime:
     """Парсит дату из newsfeed API (формат с миллисекундами) → UTC aware."""
-    return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+    return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S.%fZ").replace(
+        tzinfo=timezone.utc
+    )
 
 
 def _now_utc() -> datetime:
@@ -151,7 +157,9 @@ _API_HEADERS_BASE = {
 }
 
 
-async def fetch_new_bearer(session: aiohttp.ClientSession, login: str, password: str) -> Optional[dict]:
+async def fetch_new_bearer(
+    session: aiohttp.ClientSession, login: str, password: str
+) -> Optional[dict]:
     """
     Получает новый Bearer по логину и паролю.
     Возвращает {"token": str, "expires_at": datetime} или None при ошибке.
@@ -179,6 +187,7 @@ async def fetch_new_bearer(session: aiohttp.ClientSession, login: str, password:
             expires_at = None
             try:
                 import base64, json as _json
+
                 payload_b64 = token.split(".")[1]
                 # Добиваем до кратного 4 длины
                 payload_b64 += "=" * (4 - len(payload_b64) % 4)
@@ -238,10 +247,15 @@ async def api_get_with_refresh(
                 new_bearer = await _try_refresh_bearer(http, user_id, chat_id)
                 if new_bearer:
                     # Повторяем запрос с новым токеном
-                    new_headers = {**_API_HEADERS_BASE, "Authorization": f"Bearer {new_bearer}"}
+                    new_headers = {
+                        **_API_HEADERS_BASE,
+                        "Authorization": f"Bearer {new_bearer}",
+                    }
                     async with http.get(
-                        url, headers=new_headers, ssl=False,
-                        timeout=aiohttp.ClientTimeout(total=15)
+                        url,
+                        headers=new_headers,
+                        ssl=False,
+                        timeout=aiohttp.ClientTimeout(total=15),
                     ) as resp2:
                         if resp2.status != 200:
                             return None
@@ -323,7 +337,10 @@ async def get_girl_ids(session: aiohttp.ClientSession, bearer: str):
 
 
 async def get_users_raw(
-    session: aiohttp.ClientSession, bearer: str, girl_account_id: str, online: bool = True
+    session: aiohttp.ClientSession,
+    bearer: str,
+    girl_account_id: str,
+    online: bool = True,
 ):
     online_str = "true" if online else "false"
     url = f"{BASE_URL}/operator/chat?profileId=pd-{girl_account_id}&criteria=PD_ACTIVE&cursor=&online={online_str}"
@@ -350,14 +367,16 @@ async def get_users(
                 created = _parse_api_dt(user["createdDate"])
                 idle = _now_utc() - created
                 if idle > timedelta(hours=2) and user["messagesLeft"] > 0:
-                    users_result.append({
-                        "user_name": user["customer"]["name"],
-                        "user_id": user["customer"]["id"],
-                        "girl_id": user["profileId"].replace("pd-", ""),
-                        "messagesLeft": user["messagesLeft"],
-                        "status": user["highlightType"],
-                        "idle_hours": round(idle.total_seconds() / 3600, 1),
-                    })
+                    users_result.append(
+                        {
+                            "user_name": user["customer"]["name"],
+                            "user_id": user["customer"]["id"],
+                            "girl_id": user["profileId"].replace("pd-", ""),
+                            "messagesLeft": user["messagesLeft"],
+                            "status": user["highlightType"],
+                            "idle_hours": round(idle.total_seconds() / 3600, 1),
+                        }
+                    )
             except Exception:
                 pass
 
@@ -365,13 +384,15 @@ async def get_users(
     if data:
         for user in data.get("dialogs", []):
             if user.get("highlightType") == "unanswered":
-                users_result.append({
-                    "user_name": user["customer"]["name"],
-                    "user_id": user["customer"]["id"],
-                    "girl_id": user["profileId"].replace("pd-", ""),
-                    "messagesLeft": user["messagesLeft"],
-                    "status": user["highlightType"],
-                })
+                users_result.append(
+                    {
+                        "user_name": user["customer"]["name"],
+                        "user_id": user["customer"]["id"],
+                        "girl_id": user["profileId"].replace("pd-", ""),
+                        "messagesLeft": user["messagesLeft"],
+                        "status": user["highlightType"],
+                    }
+                )
 
     return users_result
 
@@ -393,7 +414,9 @@ async def check_unanswered(session: aiohttp.ClientSession, bearer: str) -> int:
     messages = 0
     for user in data:
         if user:
-            limits = await get_limits(session, bearer, user["profileId"], user["customer"]["id"])
+            limits = await get_limits(
+                session, bearer, user["profileId"], user["customer"]["id"]
+            )
             if limits > 0:
                 messages += 1
             await asyncio.sleep(random.uniform(0.5, 1.5))
@@ -412,14 +435,16 @@ async def check_online_inactive(
                     created = _parse_api_dt(user["createdDate"])
                     idle = _now_utc() - created
                     if idle > timedelta(hours=1) and user["messagesLeft"] > 0:
-                        found.append({
-                            "user_name": user["customer"]["name"],
-                            "user_id": user["customer"]["id"],
-                            "girl_id": user["profileId"].replace("pd-", ""),
-                            "messagesLeft": user["messagesLeft"],
-                            "status": user.get("highlightType", ""),
-                            "idle_hours": round(idle.total_seconds() / 3600, 1),
-                        })
+                        found.append(
+                            {
+                                "user_name": user["customer"]["name"],
+                                "user_id": user["customer"]["id"],
+                                "girl_id": user["profileId"].replace("pd-", ""),
+                                "messagesLeft": user["messagesLeft"],
+                                "status": user.get("highlightType", ""),
+                                "idle_hours": round(idle.total_seconds() / 3600, 1),
+                            }
+                        )
                 except Exception:
                     pass
     return found
@@ -434,13 +459,15 @@ async def check_offline_unanswered(
         if data:
             for user in data.get("dialogs", []):
                 if user.get("highlightType") == "unanswered":
-                    found.append({
-                        "user_name": user["customer"]["name"],
-                        "user_id": user["customer"]["id"],
-                        "girl_id": user["profileId"].replace("pd-", ""),
-                        "messagesLeft": user["messagesLeft"],
-                        "status": user["highlightType"],
-                    })
+                    found.append(
+                        {
+                            "user_name": user["customer"]["name"],
+                            "user_id": user["customer"]["id"],
+                            "girl_id": user["profileId"].replace("pd-", ""),
+                            "messagesLeft": user["messagesLeft"],
+                            "status": user["highlightType"],
+                        }
+                    )
     return found
 
 
@@ -466,14 +493,16 @@ async def check_letters_available(
             letters_left = restriction.get("lettersLeft", 0)
             messages_left = restriction.get("messagesLeft", 0)
             if letters_left > 0 and messages_left > 1:
-                found.append({
-                    "user_name": user["customer"]["name"],
-                    "user_id": customer_id,
-                    "girl_id": girl_id,
-                    "profile_id": profile_id,
-                    "lettersLeft": letters_left,
-                    "messagesLeft": messages_left,
-                })
+                found.append(
+                    {
+                        "user_name": user["customer"]["name"],
+                        "user_id": customer_id,
+                        "girl_id": girl_id,
+                        "profile_id": profile_id,
+                        "lettersLeft": letters_left,
+                        "messagesLeft": messages_left,
+                    }
+                )
             await asyncio.sleep(0.3)
     return found
 
@@ -482,9 +511,7 @@ async def check_letters_available(
 WORK_SHIFT_ID = 4980
 
 
-async def get_profile_emails(
-    session: aiohttp.ClientSession, bearer: str
-) -> dict:
+async def get_profile_emails(session: aiohttp.ClientSession, bearer: str) -> dict:
     """
     GET /balance/profile → возвращает словарь {girl_id: email}.
     girl_id здесь без префикса pd-.
@@ -532,8 +559,11 @@ async def set_shift_for_profile(
 
     try:
         async with session.patch(
-            url, headers=headers, json=payload,
-            ssl=False, timeout=aiohttp.ClientTimeout(total=15)
+            url,
+            headers=headers,
+            json=payload,
+            ssl=False,
+            timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             if resp.status not in (200, 204):
                 logger.error(f"set_shift error {resp.status} for {girl_id}")
@@ -570,12 +600,14 @@ async def fetch_newsfeed_info(
             time_left = deadline - now
             girl_id = item["profileId"].replace("pd-", "")
             name = name_id.get(girl_id, girl_id)
-            result.append({
-                "girl_id": girl_id,
-                "name": name,
-                "time_left": time_left,
-                "deadline": deadline,
-            })
+            result.append(
+                {
+                    "girl_id": girl_id,
+                    "name": name,
+                    "time_left": time_left,
+                    "deadline": deadline,
+                }
+            )
         except Exception:
             pass
     return result
@@ -644,7 +676,6 @@ def _mark_sent(sess: dict, girl_id: str, user_id: str):
     sess["dedup"][(girl_id, user_id)] = _now_utc()
 
 
-
 def get_interval_seconds(multiplier: float) -> str:
     lo = int(BASE_PROFILE_INTERVAL_MIN * multiplier)
     hi = int(BASE_PROFILE_INTERVAL_MAX * multiplier)
@@ -657,39 +688,49 @@ def admin_keyboard(user_id: int) -> InlineKeyboardMarkup:
     multiplier = session.get("interval_multiplier", 1.0)
     interval_str = get_interval_seconds(multiplier)
 
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="⏹ Стоп" if running else "▶️ Старт",
-                callback_data=f"toggle_{user_id}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(text="🐢 Медленнее", callback_data=f"slower_{user_id}"),
-            InlineKeyboardButton(
-                text=f"⏱ x{multiplier:.1f} ({interval_str})", callback_data="noop"
-            ),
-            InlineKeyboardButton(text="🐇 Быстрее", callback_data=f"faster_{user_id}"),
-        ],
-        [
-            InlineKeyboardButton(
-                text="🔎 Одноразовые проверки", callback_data=f"checks_panel_{user_id}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text="🎚 Управление мониторингом", callback_data=f"monitors_{user_id}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text="🗓 Управление сменой", callback_data=f"shift_panel_{user_id}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(text="📊 Статус", callback_data=f"status_{user_id}"),
-        ],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⏹ Стоп" if running else "▶️ Старт",
+                    callback_data=f"toggle_{user_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🐢 Медленнее", callback_data=f"slower_{user_id}"
+                ),
+                InlineKeyboardButton(
+                    text=f"⏱ x{multiplier:.1f} ({interval_str})", callback_data="noop"
+                ),
+                InlineKeyboardButton(
+                    text="🐇 Быстрее", callback_data=f"faster_{user_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔎 Одноразовые проверки",
+                    callback_data=f"checks_panel_{user_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎚 Управление мониторингом",
+                    callback_data=f"monitors_{user_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗓 Управление сменой", callback_data=f"shift_panel_{user_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📊 Статус", callback_data=f"status_{user_id}"
+                ),
+            ],
+        ]
+    )
 
 
 def monitors_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -699,85 +740,143 @@ def monitors_keyboard(user_id: int) -> InlineKeyboardMarkup:
     def lbl(key: str, text: str) -> str:
         return f"{'✅' if mon.get(key) else '❌'} {text}"
 
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=lbl("messages", "Сообщения"),
-            callback_data=f"mon_toggle_messages_{user_id}",
-        )],
-        [InlineKeyboardButton(
-            text=lbl("offline", "Оффлайны"),
-            callback_data=f"mon_toggle_offline_{user_id}",
-        )],
-        [InlineKeyboardButton(
-            text=lbl("online", "Онлайны"),
-            callback_data=f"mon_toggle_online_{user_id}",
-        )],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"back_panel_{user_id}")],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=lbl("messages", "Сообщения"),
+                    callback_data=f"mon_toggle_messages_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=lbl("offline", "Оффлайны"),
+                    callback_data=f"mon_toggle_offline_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=lbl("online", "Онлайны"),
+                    callback_data=f"mon_toggle_online_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Назад", callback_data=f"back_panel_{user_id}"
+                )
+            ],
+        ]
+    )
 
 
 def checks_panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Подпанель одноразовых проверок."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="📨 Проверить уведомления",
-            callback_data=f"check_msg_{user_id}",
-        )],
-        [InlineKeyboardButton(
-            text="📴 Проверить оффлайны",
-            callback_data=f"check_offline_{user_id}",
-        )],
-        [InlineKeyboardButton(
-            text="🟢 Проверить онлайны",
-            callback_data=f"check_online_{user_id}",
-        )],
-        [InlineKeyboardButton(
-            text="✉️ Проверить письма",
-            callback_data=f"check_letters_{user_id}",
-        )],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"back_panel_{user_id}")],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📨 Проверить уведомления",
+                    callback_data=f"check_msg_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📴 Проверить оффлайны",
+                    callback_data=f"check_offline_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🟢 Проверить онлайны",
+                    callback_data=f"check_online_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✉️ Проверить письма",
+                    callback_data=f"check_letters_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Назад", callback_data=f"back_panel_{user_id}"
+                )
+            ],
+        ]
+    )
 
 
 def shift_panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Подпанель управления сменой."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="📰 Newsfeed",
-            callback_data=f"check_newsfeed_{user_id}",
-        )],
-        [InlineKeyboardButton(
-            text="⏰ Выставить смену (15:00–23:00)",
-            callback_data=f"shift_set_{user_id}",
-        )],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"back_panel_{user_id}")],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📰 Newsfeed",
+                    callback_data=f"check_newsfeed_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧊 Icebreakers",
+                    callback_data=f"check_ib_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⏰ Выставить смену (15:00–23:00)",
+                    callback_data=f"shift_set_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Назад", callback_data=f"back_panel_{user_id}"
+                )
+            ],
+        ]
+    )
 
 
 def shift_confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Клавиатура подтверждения выставления смены."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"shift_confirm_{user_id}"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data=f"shift_panel_{user_id}"),
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить", callback_data=f"shift_confirm_{user_id}"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена", callback_data=f"shift_panel_{user_id}"
+                ),
+            ]
         ]
-    ])
+    )
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔑 Добавить/сменить Bearer", callback_data="set_bearer")],
-        [InlineKeyboardButton(text="🎛 Управление", callback_data="admin_panel")],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔑 Добавить/сменить Bearer", callback_data="set_bearer"
+                )
+            ],
+            [InlineKeyboardButton(text="🎛 Управление", callback_data="admin_panel")],
+        ]
+    )
 
 
 def resume_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="▶️ Возобновить", callback_data=f"resume_{user_id}"),
-            InlineKeyboardButton(text="❌ Не нужно", callback_data="noop"),
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="▶️ Возобновить", callback_data=f"resume_{user_id}"
+                ),
+                InlineKeyboardButton(text="❌ Не нужно", callback_data="noop"),
+            ]
         ]
-    ])
+    )
 
 
 # ======================== ФОНОВАЯ ЗАДАЧА ========================
@@ -811,8 +910,11 @@ async def monitoring_task(user_id: int, chat_id: int):
 
         # --- Newsfeed: проверяем при старте ---
         await _check_and_notify_newsfeed(session, user_id, chat_id, startup=True)
-        # Множество girl_id, по которым уже отправили напоминание за 15 мин
         session_data["newsfeed_reminded"] = set()
+        session_data["ib_notified"] = set()
+
+        # --- Icebreakers: проверяем при старте ---
+        await _check_and_notify_icebreakers(session, user_id, chat_id)
 
         # --- Bearer: проверяем при старте нужно ли скоро обновить ---
         await _check_bearer_expiry(session, user_id, chat_id)
@@ -821,11 +923,16 @@ async def monitoring_task(user_id: int, chat_id: int):
             id_: asyncio.get_event_loop().time() + random.randint(0, 20)
             for id_ in list_of_id
         }
-        message_interval = random.randint(BASE_MESSAGE_INTERVAL_MIN, BASE_MESSAGE_INTERVAL_MAX)
+        message_interval = random.randint(
+            BASE_MESSAGE_INTERVAL_MIN, BASE_MESSAGE_INTERVAL_MAX
+        )
         next_message_check = asyncio.get_event_loop().time() + message_interval
 
         # Newsfeed проверяем каждые 30 секунд
         next_newsfeed_check = asyncio.get_event_loop().time() + 30
+
+        # Icebreakers проверяем каждые 30 минут
+        next_ib_check = asyncio.get_event_loop().time() + IB_CHECK_INTERVAL
 
         # Bearer expiry проверяем каждые 10 минут
         next_bearer_check = asyncio.get_event_loop().time() + 600
@@ -843,36 +950,53 @@ async def monitoring_task(user_id: int, chat_id: int):
                         users = []
 
                         if mon.get("online"):
-                            data = await get_users_raw(session, bearer, id_, online=True)
+                            data = await get_users_raw(
+                                session, bearer, id_, online=True
+                            )
                             if data:
                                 for u in data.get("dialogs", []):
                                     try:
                                         created = _parse_api_dt(u["createdDate"])
                                         idle = _now_utc() - created
-                                        if idle > timedelta(hours=2) and u["messagesLeft"] > 0:
-                                            users.append({
-                                                "user_name": u["customer"]["name"],
-                                                "user_id": u["customer"]["id"],
-                                                "girl_id": u["profileId"].replace("pd-", ""),
-                                                "messagesLeft": u["messagesLeft"],
-                                                "status": u["highlightType"],
-                                                "idle_hours": round(idle.total_seconds() / 3600, 1),
-                                            })
+                                        if (
+                                            idle > timedelta(hours=2)
+                                            and u["messagesLeft"] > 0
+                                        ):
+                                            users.append(
+                                                {
+                                                    "user_name": u["customer"]["name"],
+                                                    "user_id": u["customer"]["id"],
+                                                    "girl_id": u["profileId"].replace(
+                                                        "pd-", ""
+                                                    ),
+                                                    "messagesLeft": u["messagesLeft"],
+                                                    "status": u["highlightType"],
+                                                    "idle_hours": round(
+                                                        idle.total_seconds() / 3600, 1
+                                                    ),
+                                                }
+                                            )
                                     except Exception:
                                         pass
 
                         if mon.get("offline"):
-                            data = await get_users_raw(session, bearer, id_, online=False)
+                            data = await get_users_raw(
+                                session, bearer, id_, online=False
+                            )
                             if data:
                                 for u in data.get("dialogs", []):
                                     if u.get("highlightType") == "unanswered":
-                                        users.append({
-                                            "user_name": u["customer"]["name"],
-                                            "user_id": u["customer"]["id"],
-                                            "girl_id": u["profileId"].replace("pd-", ""),
-                                            "messagesLeft": u["messagesLeft"],
-                                            "status": u["highlightType"],
-                                        })
+                                        users.append(
+                                            {
+                                                "user_name": u["customer"]["name"],
+                                                "user_id": u["customer"]["id"],
+                                                "girl_id": u["profileId"].replace(
+                                                    "pd-", ""
+                                                ),
+                                                "messagesLeft": u["messagesLeft"],
+                                                "status": u["highlightType"],
+                                            }
+                                        )
 
                         for user in users:
                             gid = user["girl_id"]
@@ -893,12 +1017,16 @@ async def monitoring_task(user_id: int, chat_id: int):
                                 await bot.send_message(chat_id, text, parse_mode="HTML")
                             else:
                                 await bot.send_message(
-                                    chat_id, text, parse_mode="HTML",
+                                    chat_id,
+                                    text,
+                                    parse_mode="HTML",
                                     reply_markup=snooze_keyboard(gid, uid_str),
                                 )
 
                     interval = (
-                        random.randint(BASE_PROFILE_INTERVAL_MIN, BASE_PROFILE_INTERVAL_MAX)
+                        random.randint(
+                            BASE_PROFILE_INTERVAL_MIN, BASE_PROFILE_INTERVAL_MAX
+                        )
                         * multiplier
                     )
                     next_check[id_] = now + interval
@@ -914,10 +1042,15 @@ async def monitoring_task(user_id: int, chat_id: int):
                         )
                 next_message_check += message_interval * multiplier
 
-            # Проверка newsfeed (напоминания за 15 мин)
+            # Проверка newsfeed (когда истекло)
             if now >= next_newsfeed_check:
                 await _newsfeed_remind_if_needed(session, user_id, chat_id)
                 next_newsfeed_check = now + 30
+
+            # Проверка icebreakers каждые 30 минут
+            if now >= next_ib_check:
+                await _check_and_notify_icebreakers(session, user_id, chat_id)
+                next_ib_check = now + IB_CHECK_INTERVAL
 
             # Проверка Bearer на истечение
             if now >= next_bearer_check:
@@ -929,6 +1062,84 @@ async def monitoring_task(user_id: int, chat_id: int):
     session_data["running"] = False
     save_sessions()
     await bot.send_message(chat_id, "⏹ Мониторинг остановлен.")
+
+
+# ======================== ICEBREAKERS ========================
+async def get_icebreakers(
+    session: aiohttp.ClientSession, bearer: str, girl_id: str
+) -> list:
+    url = f"{BASE_URL}/scheduler/icebreakers/in-progress?profileId=pd-{girl_id}"
+    data = await api_get(session, url, bearer)
+    return data if isinstance(data, list) else []
+
+
+async def check_icebreakers_outdated(
+    session: aiohttp.ClientSession, bearer: str, list_of_id: list, name_id: dict
+) -> list:
+    """
+    Возвращает список анкет у которых хотя бы один icebreaker
+    не обновлялся более IB_INTERVAL (6 часов).
+    Одна запись на анкету — имя + сколько времени прошло с последнего запуска.
+    """
+    outdated = []
+    now = _now_utc()
+    for girl_id in list_of_id:
+        items = await get_icebreakers(session, bearer, girl_id)
+        if not items:
+            await asyncio.sleep(0.3)
+            continue
+        # Берём максимальное dateLastLaunched среди всех постов анкеты
+        latest = None
+        for item in items:
+            try:
+                dt = _parse_newsfeed_dt(item["dateLastLaunched"])
+                if latest is None or dt > latest:
+                    latest = dt
+            except Exception:
+                pass
+        if latest is not None:
+            idle = now - latest
+            if idle > IB_INTERVAL:
+                outdated.append(
+                    {
+                        "girl_id": girl_id,
+                        "name": name_id.get(girl_id, girl_id),
+                        "idle": idle,
+                    }
+                )
+        await asyncio.sleep(0.3)
+    return outdated
+
+
+async def _check_and_notify_icebreakers(
+    session: aiohttp.ClientSession, user_id: int, chat_id: int
+):
+    """Проверяет icebreakers и уведомляет об устаревших анкетах."""
+    sess = user_sessions.get(user_id, {})
+    list_of_id = sess.get("list_of_id", [])
+    name_id = sess.get("name_id", {})
+    bearer = sess.get("bearer", "")
+    ib_notified: set = sess.get("ib_notified", set())
+
+    outdated = await check_icebreakers_outdated(session, bearer, list_of_id, name_id)
+
+    # Уведомляем только по тем анкетам, по которым ещё не слали в этом цикле
+    new_outdated = [o for o in outdated if o["girl_id"] not in ib_notified]
+
+    # Сбрасываем notified для тех, кто больше не устарел (обновили)
+    current_outdated_ids = {o["girl_id"] for o in outdated}
+    ib_notified &= current_outdated_ids
+    sess["ib_notified"] = ib_notified
+
+    if new_outdated:
+        lines = ["🧊 <b>Icebreakers требуют обновления:</b>\n"]
+        for o in new_outdated:
+            lines.append(
+                f"⚠️ <b>{o['name']}</b> — последний запуск {_format_timedelta(o['idle'])} назад"
+            )
+            ib_notified.add(o["girl_id"])
+        sess["ib_notified"] = ib_notified
+        await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
 # ======================== NEWSFEED ЛОГИКА ========================
@@ -1155,17 +1366,18 @@ async def process_bearer(message: Message, state: FSMContext):
 
     prev_monitors = (
         user_sessions[user_id].get("monitors", DEFAULT_MONITORS.copy())
-        if user_id in user_sessions else DEFAULT_MONITORS.copy()
+        if user_id in user_sessions
+        else DEFAULT_MONITORS.copy()
     )
     prev_creds = (
-        user_sessions[user_id].get("credentials")
-        if user_id in user_sessions else None
+        user_sessions[user_id].get("credentials") if user_id in user_sessions else None
     )
 
     # Пробуем вытащить expires_at из JWT
     bearer_expires_at = None
     try:
         import base64, json as _json
+
         payload_b64 = bearer.split(".")[1]
         payload_b64 += "=" * (4 - len(payload_b64) % 4)
         jwt_payload = _json.loads(base64.b64decode(payload_b64))
@@ -1200,7 +1412,9 @@ async def process_bearer(message: Message, state: FSMContext):
 
     expiry_text = ""
     if bearer_expires_at:
-        expiry_text = f"\n🗓 Токен действует до: {bearer_expires_at.strftime('%d.%m.%Y')} UTC"
+        expiry_text = (
+            f"\n🗓 Токен действует до: {bearer_expires_at.strftime('%d.%m.%Y')} UTC"
+        )
 
     await message.answer(
         f"✅ Bearer принят! Запускаю мониторинг...{expiry_text}\n"
@@ -1438,10 +1652,14 @@ async def cb_check_offline(callback: CallbackQuery):
         return
     await callback.answer("📴 Проверяю оффлайны...")
     async with aiohttp.ClientSession() as http_session:
-        found = await check_offline_unanswered(http_session, session["bearer"], list_of_id)
+        found = await check_offline_unanswered(
+            http_session, session["bearer"], list_of_id
+        )
     if found:
         for u in found:
-            await callback.message.answer(format_user_alert(u, name_id), parse_mode="HTML")
+            await callback.message.answer(
+                format_user_alert(u, name_id), parse_mode="HTML"
+            )
     else:
         await callback.message.answer("✅ Оффлайн-уведомлений нет.")
 
@@ -1471,7 +1689,9 @@ async def cb_check_online(callback: CallbackQuery):
             f"🟢 <b>Онлайн без ответа ({len(found)}):</b>", parse_mode="HTML"
         )
         for u in found:
-            await callback.message.answer(format_user_alert(u, name_id), parse_mode="HTML")
+            await callback.message.answer(
+                format_user_alert(u, name_id), parse_mode="HTML"
+            )
     else:
         await callback.message.answer("✅ Онлайн-пользователей без ответа нет.")
 
@@ -1495,7 +1715,9 @@ async def cb_check_letters(callback: CallbackQuery):
         return
     await callback.answer("✉️ Проверяю письма...")
     async with aiohttp.ClientSession() as http_session:
-        found = await check_letters_available(http_session, session["bearer"], list_of_id)
+        found = await check_letters_available(
+            http_session, session["bearer"], list_of_id
+        )
     if found:
         await callback.message.answer(
             f"✉️ <b>Доступны письма ({len(found)}):</b>", parse_mode="HTML"
@@ -1554,7 +1776,9 @@ async def cb_shift_set(callback: CallbackQuery):
     async with aiohttp.ClientSession() as http:
         emails = await get_profile_emails(http, sess["bearer"])
 
-    sess["profile_emails"] = emails  # кэшируем, чтобы не запрашивать повторно при confirm
+    sess["profile_emails"] = (
+        emails  # кэшируем, чтобы не запрашивать повторно при confirm
+    )
 
     lines = ["⏰ <b>Выставить смену (15:00–23:00) для анкет:</b>\n"]
     missing = []
@@ -1568,7 +1792,9 @@ async def cb_shift_set(callback: CallbackQuery):
             missing.append(name)
 
     if missing:
-        lines.append(f"\n⚠️ {len(missing)} анкет будут пропущены из-за отсутствия email.")
+        lines.append(
+            f"\n⚠️ {len(missing)} анкет будут пропущены из-за отсутствия email."
+        )
 
     lines.append("\nПодтвердить?")
 
@@ -1597,7 +1823,9 @@ async def cb_shift_confirm(callback: CallbackQuery):
     bearer = sess["bearer"]
 
     await callback.answer("⏳ Выставляю смену...")
-    await callback.message.edit_text("⏳ Выставляю смену для всех анкет...", parse_mode="HTML")
+    await callback.message.edit_text(
+        "⏳ Выставляю смену для всех анкет...", parse_mode="HTML"
+    )
 
     ok, failed, skipped = [], [], []
 
@@ -1623,15 +1851,54 @@ async def cb_shift_confirm(callback: CallbackQuery):
     for name in skipped:
         lines.append(f"⚠️ {name} — нет email, пропущена")
 
-    lines.append(f"\n<b>Итого:</b> {len(ok)} успешно, {len(failed)} ошибок, {len(skipped)} пропущено")
+    lines.append(
+        f"\n<b>Итого:</b> {len(ok)} успешно, {len(failed)} ошибок, {len(skipped)} пропущено"
+    )
 
     await callback.message.edit_text(
         "\n".join(lines),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"shift_panel_{uid}")]
-        ]),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="◀️ Назад", callback_data=f"shift_panel_{uid}"
+                    )
+                ]
+            ]
+        ),
     )
+
+
+@dp.callback_query(F.data.startswith("check_ib_"))
+async def cb_check_ib(callback: CallbackQuery):
+    uid = int(callback.data.split("_")[2])
+    if callback.from_user.id != uid:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    sess = user_sessions.get(uid)
+    if not sess:
+        await callback.answer("❌ Нет сессии", show_alert=True)
+        return
+    if not sess.get("list_of_id"):
+        await callback.answer(
+            "❌ Анкеты не загружены. Дождись запуска мониторинга.", show_alert=True
+        )
+        return
+    await callback.answer("🧊 Проверяю Icebreakers...")
+    async with aiohttp.ClientSession() as http:
+        outdated = await check_icebreakers_outdated(
+            http, sess["bearer"], sess["list_of_id"], sess["name_id"]
+        )
+    if outdated:
+        lines = ["🧊 <b>Icebreakers требуют обновления:</b>\n"]
+        for o in outdated:
+            lines.append(
+                f"⚠️ <b>{o['name']}</b> — последний запуск {_format_timedelta(o['idle'])} назад"
+            )
+        await callback.message.answer("\n".join(lines), parse_mode="HTML")
+    else:
+        await callback.message.answer("✅ Все Icebreakers актуальны.")
 
 
 @dp.callback_query(F.data.startswith("check_newsfeed_"))
@@ -1677,7 +1944,8 @@ async def cb_status(callback: CallbackQuery):
     interval_str = get_interval_seconds(multiplier)
     mon = session.get("monitors", DEFAULT_MONITORS.copy())
 
-    def tick(k): return "✅" if mon.get(k) else "❌"
+    def tick(k):
+        return "✅" if mon.get(k) else "❌"
 
     expires_at = session.get("bearer_expires_at")
     bearer_line = ""
@@ -1685,7 +1953,11 @@ async def cb_status(callback: CallbackQuery):
         tl = expires_at - _now_utc()
         bearer_line = f"\n🔑 Bearer истекает через: {_format_timedelta(tl)}"
 
-    creds_line = "✅ Авто-обновление настроено" if session.get("credentials") else "⚠️ Авто-обновление не настроено (/setcredentials)"
+    creds_line = (
+        "✅ Авто-обновление настроено"
+        if session.get("credentials")
+        else "⚠️ Авто-обновление не настроено (/setcredentials)"
+    )
 
     await callback.message.answer(
         f"📊 <b>Статус мониторинга</b>\n\n"
@@ -1794,7 +2066,9 @@ async def cmd_users(message: Message):
     for uid, sess in user_sessions.items():
         status = "🟢" if sess.get("running") else "🔴"
         creds = "🔐" if sess.get("credentials") else "🔑"
-        text += f"{status}{creds} ID: {uid}, профилей: {len(sess.get('list_of_id', []))}\n"
+        text += (
+            f"{status}{creds} ID: {uid}, профилей: {len(sess.get('list_of_id', []))}\n"
+        )
     await message.answer(text, parse_mode="HTML")
 
 
@@ -1846,7 +2120,9 @@ async def main():
                     reply_markup=resume_keyboard(uid),
                 )
             except Exception as e:
-                logger.warning(f"Не удалось отправить сообщение пользователю {uid}: {e}")
+                logger.warning(
+                    f"Не удалось отправить сообщение пользователю {uid}: {e}"
+                )
 
         logger.info(f"Restored session for user {uid} (was_running={was_running})")
 
