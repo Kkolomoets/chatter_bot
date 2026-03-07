@@ -43,7 +43,10 @@ BEARER_MIN_REFRESH_INTERVAL = timedelta(hours=1)
 NEWSFEED_INTERVAL = timedelta(hours=12)
 SHIFT_DURATION = timedelta(hours=8)
 NEWSFEED_WARN_BEFORE = timedelta(minutes=0)  # уведомлять когда истекло
-NEWSFEED_CHECK_INTERVAL = 300  # секунд между проверками newsfeed
+NEWSFEED_CHECK_INTERVAL = 30  # секунд между проверками newsfeed
+
+IB_INTERVAL = timedelta(hours=6)  # icebreakers: порог устаревания
+IB_CHECK_INTERVAL = 30 * 60  # секунд между проверками icebreakers (30 мин)
 
 DEDUP_WINDOW = timedelta(minutes=8)  # антидубль: не повторять пару (girl_id, user_id)
 SNOOZE_OPTIONS = [  # варианты игнора (секунды, метка)
@@ -468,6 +471,109 @@ async def check_offline_unanswered(
     return found
 
 
+async def check_letters_available(
+    session: aiohttp.ClientSession, bearer: str, list_of_id: list
+) -> list:
+    """
+    Проверяет онлайн-пользователей у всех анкет.
+    Возвращает тех у кого lettersLeft > 0 и messagesLeft > 1.
+    """
+    found = []
+    for girl_id in list_of_id:
+        data = await get_users_raw(session, bearer, girl_id, online=True)
+        if not data:
+            continue
+        for user in data.get("dialogs", []):
+            customer_id = user["customer"]["id"]
+            profile_id = user["profileId"]
+            url = f"{BASE_URL}/operator/chat/restriction?profileId={profile_id}&customerId={customer_id}"
+            restriction = await api_get(session, url, bearer)
+            if not restriction:
+                continue
+            letters_left = restriction.get("lettersLeft", 0)
+            messages_left = restriction.get("messagesLeft", 0)
+            if letters_left > 0 and messages_left > 1:
+                found.append(
+                    {
+                        "user_name": user["customer"]["name"],
+                        "user_id": customer_id,
+                        "girl_id": girl_id,
+                        "profile_id": profile_id,
+                        "lettersLeft": letters_left,
+                        "messagesLeft": messages_left,
+                    }
+                )
+            await asyncio.sleep(0.3)
+    return found
+
+
+# ======================== СМЕНА ========================
+WORK_SHIFT_ID = 4980
+
+
+async def get_profile_emails(session: aiohttp.ClientSession, bearer: str) -> dict:
+    """
+    GET /balance/profile → возвращает словарь {girl_id: email}.
+    girl_id здесь без префикса pd-.
+    """
+    url = f"{BASE_URL}/balance/profile"
+    data = await api_get(session, url, bearer)
+    if not data:
+        return {}
+    result = {}
+    for item in data.get("balances", []):
+        profile_id = item.get("profileId", "").replace("pd-", "")
+        email = item.get("email", "")
+        if profile_id and email:
+            result[profile_id] = email
+    return result
+
+
+async def set_shift_for_profile(
+    session: aiohttp.ClientSession,
+    bearer: str,
+    girl_id: str,
+    name: str,
+    email: str,
+) -> bool:
+    """
+    PATCH /identity/profiles/pd-{girl_id}
+    Сначала GET чтобы забрать текущие поля профиля (scope и др.),
+    потом PATCH с полным объектом — только workShiftId меняем.
+    """
+    url = f"{BASE_URL}/identity/profiles/pd-{girl_id}"
+    headers = {
+        **_API_HEADERS_BASE,
+        "Authorization": f"Bearer {bearer}",
+        "Content-Type": "application/json",
+    }
+
+    # Шаг 1: получаем текущий профиль
+    current = await api_get(session, url, bearer)
+    if current is None:
+        logger.error(f"set_shift: не удалось получить профиль {girl_id}")
+        return False
+
+    # Шаг 2: берём текущий объект и меняем только нужные поля
+    payload = {**current, "name": name, "email": email, "workShiftId": WORK_SHIFT_ID}
+
+    try:
+        async with session.patch(
+            url,
+            headers=headers,
+            json=payload,
+            ssl=False,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status not in (200, 204):
+                logger.error(f"set_shift error {resp.status} for {girl_id}")
+                return False
+            return True
+    except Exception as e:
+        logger.error(f"set_shift exception for {girl_id}: {e}")
+        return False
+
+
 # ======================== NEWSFEED ========================
 async def get_newsfeed_statuses(session: aiohttp.ClientSession, bearer: str) -> list:
     """Возвращает сырой список статусов newsfeed."""
@@ -603,27 +709,19 @@ def admin_keyboard(user_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="🔍 Проверить сообщения", callback_data=f"check_msg_{user_id}"
-                ),
-                InlineKeyboardButton(
-                    text="📴 Проверить оффлайны",
-                    callback_data=f"check_offline_{user_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🟢 Проверить онлайны", callback_data=f"check_online_{user_id}"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📰 Newsfeed", callback_data=f"check_newsfeed_{user_id}"
+                    text="🔎 Одноразовые проверки",
+                    callback_data=f"checks_panel_{user_id}",
                 ),
             ],
             [
                 InlineKeyboardButton(
                     text="🎚 Управление мониторингом",
                     callback_data=f"monitors_{user_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗓 Управление сменой", callback_data=f"shift_panel_{user_id}"
                 ),
             ],
             [
@@ -667,6 +765,90 @@ def monitors_keyboard(user_id: int) -> InlineKeyboardMarkup:
                     text="◀️ Назад", callback_data=f"back_panel_{user_id}"
                 )
             ],
+        ]
+    )
+
+
+def checks_panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Подпанель одноразовых проверок."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📨 Проверить уведомления",
+                    callback_data=f"check_msg_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📴 Проверить оффлайны",
+                    callback_data=f"check_offline_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🟢 Проверить онлайны",
+                    callback_data=f"check_online_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✉️ Проверить письма",
+                    callback_data=f"check_letters_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Назад", callback_data=f"back_panel_{user_id}"
+                )
+            ],
+        ]
+    )
+
+
+def shift_panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Подпанель управления сменой."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📰 Newsfeed",
+                    callback_data=f"check_newsfeed_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧊 Icebreakers",
+                    callback_data=f"check_ib_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⏰ Выставить смену (15:00–23:00)",
+                    callback_data=f"shift_set_{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Назад", callback_data=f"back_panel_{user_id}"
+                )
+            ],
+        ]
+    )
+
+
+def shift_confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура подтверждения выставления смены."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить", callback_data=f"shift_confirm_{user_id}"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена", callback_data=f"shift_panel_{user_id}"
+                ),
+            ]
         ]
     )
 
@@ -728,8 +910,11 @@ async def monitoring_task(user_id: int, chat_id: int):
 
         # --- Newsfeed: проверяем при старте ---
         await _check_and_notify_newsfeed(session, user_id, chat_id, startup=True)
-        # Множество girl_id, по которым уже отправили напоминание за 15 мин
         session_data["newsfeed_reminded"] = set()
+        session_data["ib_notified"] = set()
+
+        # --- Icebreakers: проверяем при старте ---
+        await _check_and_notify_icebreakers(session, user_id, chat_id)
 
         # --- Bearer: проверяем при старте нужно ли скоро обновить ---
         await _check_bearer_expiry(session, user_id, chat_id)
@@ -745,6 +930,9 @@ async def monitoring_task(user_id: int, chat_id: int):
 
         # Newsfeed проверяем каждые 30 секунд
         next_newsfeed_check = asyncio.get_event_loop().time() + 30
+
+        # Icebreakers проверяем каждые 30 минут
+        next_ib_check = asyncio.get_event_loop().time() + IB_CHECK_INTERVAL
 
         # Bearer expiry проверяем каждые 10 минут
         next_bearer_check = asyncio.get_event_loop().time() + 600
@@ -854,10 +1042,15 @@ async def monitoring_task(user_id: int, chat_id: int):
                         )
                 next_message_check += message_interval * multiplier
 
-            # Проверка newsfeed (напоминания за 15 мин)
+            # Проверка newsfeed (когда истекло)
             if now >= next_newsfeed_check:
                 await _newsfeed_remind_if_needed(session, user_id, chat_id)
                 next_newsfeed_check = now + 30
+
+            # Проверка icebreakers каждые 30 минут
+            if now >= next_ib_check:
+                await _check_and_notify_icebreakers(session, user_id, chat_id)
+                next_ib_check = now + IB_CHECK_INTERVAL
 
             # Проверка Bearer на истечение
             if now >= next_bearer_check:
@@ -869,6 +1062,84 @@ async def monitoring_task(user_id: int, chat_id: int):
     session_data["running"] = False
     save_sessions()
     await bot.send_message(chat_id, "⏹ Мониторинг остановлен.")
+
+
+# ======================== ICEBREAKERS ========================
+async def get_icebreakers(
+    session: aiohttp.ClientSession, bearer: str, girl_id: str
+) -> list:
+    url = f"{BASE_URL}/scheduler/icebreakers/in-progress?profileId=pd-{girl_id}"
+    data = await api_get(session, url, bearer)
+    return data if isinstance(data, list) else []
+
+
+async def check_icebreakers_outdated(
+    session: aiohttp.ClientSession, bearer: str, list_of_id: list, name_id: dict
+) -> list:
+    """
+    Возвращает список анкет у которых хотя бы один icebreaker
+    не обновлялся более IB_INTERVAL (6 часов).
+    Одна запись на анкету — имя + сколько времени прошло с последнего запуска.
+    """
+    outdated = []
+    now = _now_utc()
+    for girl_id in list_of_id:
+        items = await get_icebreakers(session, bearer, girl_id)
+        if not items:
+            await asyncio.sleep(0.3)
+            continue
+        # Берём максимальное dateLastLaunched среди всех постов анкеты
+        latest = None
+        for item in items:
+            try:
+                dt = _parse_newsfeed_dt(item["dateLastLaunched"])
+                if latest is None or dt > latest:
+                    latest = dt
+            except Exception:
+                pass
+        if latest is not None:
+            idle = now - latest
+            if idle > IB_INTERVAL:
+                outdated.append(
+                    {
+                        "girl_id": girl_id,
+                        "name": name_id.get(girl_id, girl_id),
+                        "idle": idle,
+                    }
+                )
+        await asyncio.sleep(0.3)
+    return outdated
+
+
+async def _check_and_notify_icebreakers(
+    session: aiohttp.ClientSession, user_id: int, chat_id: int
+):
+    """Проверяет icebreakers и уведомляет об устаревших анкетах."""
+    sess = user_sessions.get(user_id, {})
+    list_of_id = sess.get("list_of_id", [])
+    name_id = sess.get("name_id", {})
+    bearer = sess.get("bearer", "")
+    ib_notified: set = sess.get("ib_notified", set())
+
+    outdated = await check_icebreakers_outdated(session, bearer, list_of_id, name_id)
+
+    # Уведомляем только по тем анкетам, по которым ещё не слали в этом цикле
+    new_outdated = [o for o in outdated if o["girl_id"] not in ib_notified]
+
+    # Сбрасываем notified для тех, кто больше не устарел (обновили)
+    current_outdated_ids = {o["girl_id"] for o in outdated}
+    ib_notified &= current_outdated_ids
+    sess["ib_notified"] = ib_notified
+
+    if new_outdated:
+        lines = ["🧊 <b>Icebreakers требуют обновления:</b>\n"]
+        for o in new_outdated:
+            lines.append(
+                f"⚠️ <b>{o['name']}</b> — последний запуск {_format_timedelta(o['idle'])} назад"
+            )
+            ib_notified.add(o["girl_id"])
+        sess["ib_notified"] = ib_notified
+        await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
 # ======================== NEWSFEED ЛОГИКА ========================
@@ -1324,6 +1595,23 @@ async def cb_slower(callback: CallbackQuery):
 
 
 # ======================== CALLBACK: ОДНОРАЗОВЫЕ ПРОВЕРКИ ========================
+@dp.callback_query(F.data.startswith("checks_panel_"))
+async def cb_checks_panel(callback: CallbackQuery):
+    uid = int(callback.data.split("_")[2])
+    if callback.from_user.id != uid:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    if uid not in user_sessions:
+        await callback.answer("❌ Нет сессии", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🔎 <b>Одноразовые проверки</b>",
+        parse_mode="HTML",
+        reply_markup=checks_panel_keyboard(uid),
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("check_msg_"))
 async def cb_check_msg(callback: CallbackQuery):
     user_id = int(callback.data.split("_")[2])
@@ -1334,7 +1622,7 @@ async def cb_check_msg(callback: CallbackQuery):
     if not session:
         await callback.answer("❌ Нет сессии", show_alert=True)
         return
-    await callback.answer("🔍 Проверяю...")
+    await callback.answer("📨 Проверяю...")
     async with aiohttp.ClientSession() as http_session:
         messages = await check_unanswered(http_session, session["bearer"])
     if messages:
@@ -1406,6 +1694,211 @@ async def cb_check_online(callback: CallbackQuery):
             )
     else:
         await callback.message.answer("✅ Онлайн-пользователей без ответа нет.")
+
+
+@dp.callback_query(F.data.startswith("check_letters_"))
+async def cb_check_letters(callback: CallbackQuery):
+    user_id = int(callback.data.split("_")[2])
+    if callback.from_user.id != user_id:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    session = user_sessions.get(user_id)
+    if not session:
+        await callback.answer("❌ Нет сессии", show_alert=True)
+        return
+    list_of_id = session.get("list_of_id", [])
+    name_id = session.get("name_id", {})
+    if not list_of_id:
+        await callback.answer(
+            "❌ Анкеты не загружены. Дождись запуска мониторинга.", show_alert=True
+        )
+        return
+    await callback.answer("✉️ Проверяю письма...")
+    async with aiohttp.ClientSession() as http_session:
+        found = await check_letters_available(
+            http_session, session["bearer"], list_of_id
+        )
+    if found:
+        await callback.message.answer(
+            f"✉️ <b>Доступны письма ({len(found)}):</b>", parse_mode="HTML"
+        )
+        for u in found:
+            girl_name = name_id.get(u["girl_id"], u["girl_id"])
+            await callback.message.answer(
+                f"👤 <b>{u['user_name']}</b>\n"
+                f"📋 Анкета: {girl_name}\n"
+                f"✉️ Писем: {u['lettersLeft']}  💬 Сообщений: {u['messagesLeft']}",
+                parse_mode="HTML",
+            )
+    else:
+        await callback.message.answer("✅ Пользователей с доступными письмами нет.")
+
+
+# ======================== CALLBACK: ПОДПАНЕЛЬ СМЕНЫ ========================
+@dp.callback_query(F.data.startswith("shift_panel_"))
+async def cb_shift_panel(callback: CallbackQuery):
+    uid = int(callback.data.split("_")[2])
+    if callback.from_user.id != uid:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🗓 <b>Управление сменой</b>",
+        parse_mode="HTML",
+        reply_markup=shift_panel_keyboard(uid),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("shift_set_"))
+async def cb_shift_set(callback: CallbackQuery):
+    """Показывает список анкет и просит подтвердить выставление смены."""
+    uid = int(callback.data.split("_")[2])
+    if callback.from_user.id != uid:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    sess = user_sessions.get(uid)
+    if not sess:
+        await callback.answer("❌ Нет сессии", show_alert=True)
+        return
+
+    list_of_id = sess.get("list_of_id", [])
+    name_id = sess.get("name_id", {})
+
+    if not list_of_id:
+        await callback.answer(
+            "❌ Анкеты не загружены. Сначала запусти мониторинг.", show_alert=True
+        )
+        return
+
+    await callback.answer("📋 Загружаю список анкет...")
+
+    # Получаем email'ы и сохраняем в сессии
+    async with aiohttp.ClientSession() as http:
+        emails = await get_profile_emails(http, sess["bearer"])
+
+    sess["profile_emails"] = (
+        emails  # кэшируем, чтобы не запрашивать повторно при confirm
+    )
+
+    lines = ["⏰ <b>Выставить смену (15:00–23:00) для анкет:</b>\n"]
+    missing = []
+    for gid in list_of_id:
+        name = name_id.get(gid, gid)
+        email = emails.get(gid)
+        if email:
+            lines.append(f"✅ {name}")
+        else:
+            lines.append(f"⚠️ {name} — email не найден, будет пропущена")
+            missing.append(name)
+
+    if missing:
+        lines.append(
+            f"\n⚠️ {len(missing)} анкет будут пропущены из-за отсутствия email."
+        )
+
+    lines.append("\nПодтвердить?")
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=shift_confirm_keyboard(uid),
+    )
+
+
+@dp.callback_query(F.data.startswith("shift_confirm_"))
+async def cb_shift_confirm(callback: CallbackQuery):
+    """Выставляет смену для всех анкет."""
+    uid = int(callback.data.split("_")[2])
+    if callback.from_user.id != uid:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    sess = user_sessions.get(uid)
+    if not sess:
+        await callback.answer("❌ Нет сессии", show_alert=True)
+        return
+
+    list_of_id = sess.get("list_of_id", [])
+    name_id = sess.get("name_id", {})
+    emails = sess.get("profile_emails", {})
+    bearer = sess["bearer"]
+
+    await callback.answer("⏳ Выставляю смену...")
+    await callback.message.edit_text(
+        "⏳ Выставляю смену для всех анкет...", parse_mode="HTML"
+    )
+
+    ok, failed, skipped = [], [], []
+
+    async with aiohttp.ClientSession() as http:
+        for gid in list_of_id:
+            name = name_id.get(gid, gid)
+            email = emails.get(gid)
+            if not email:
+                skipped.append(name)
+                continue
+            success = await set_shift_for_profile(http, bearer, gid, name, email)
+            if success:
+                ok.append(name)
+            else:
+                failed.append(name)
+            await asyncio.sleep(0.3)  # небольшая пауза между запросами
+
+    lines = ["🗓 <b>Результат выставления смены:</b>\n"]
+    for name in ok:
+        lines.append(f"✅ {name}")
+    for name in failed:
+        lines.append(f"❌ {name} — ошибка запроса")
+    for name in skipped:
+        lines.append(f"⚠️ {name} — нет email, пропущена")
+
+    lines.append(
+        f"\n<b>Итого:</b> {len(ok)} успешно, {len(failed)} ошибок, {len(skipped)} пропущено"
+    )
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="◀️ Назад", callback_data=f"shift_panel_{uid}"
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+@dp.callback_query(F.data.startswith("check_ib_"))
+async def cb_check_ib(callback: CallbackQuery):
+    uid = int(callback.data.split("_")[2])
+    if callback.from_user.id != uid:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    sess = user_sessions.get(uid)
+    if not sess:
+        await callback.answer("❌ Нет сессии", show_alert=True)
+        return
+    if not sess.get("list_of_id"):
+        await callback.answer(
+            "❌ Анкеты не загружены. Дождись запуска мониторинга.", show_alert=True
+        )
+        return
+    await callback.answer("🧊 Проверяю Icebreakers...")
+    async with aiohttp.ClientSession() as http:
+        outdated = await check_icebreakers_outdated(
+            http, sess["bearer"], sess["list_of_id"], sess["name_id"]
+        )
+    if outdated:
+        lines = ["🧊 <b>Icebreakers требуют обновления:</b>\n"]
+        for o in outdated:
+            lines.append(
+                f"⚠️ <b>{o['name']}</b> — последний запуск {_format_timedelta(o['idle'])} назад"
+            )
+        await callback.message.answer("\n".join(lines), parse_mode="HTML")
+    else:
+        await callback.message.answer("✅ Все Icebreakers актуальны.")
 
 
 @dp.callback_query(F.data.startswith("check_newsfeed_"))
