@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ======================== НАСТРОЙКИ ========================
-BOT_TOKEN = getenv("BOT_TOKEN")
+BOT_TOKEN = getenv("TEST_BOT_TOKEN")
 ADMIN_IDS = [970941850]
 SESSIONS_FILE = "sessions.json"
 
@@ -2292,12 +2292,18 @@ async def cb_check_ib(callback: CallbackQuery):
             http, sess["bearer"], sess["list_of_id"], sess["name_id"]
         )
     if outdated:
+        sess["ib_outdated_ids"] = [o["girl_id"] for o in outdated]
         lines = ["🧊 <b>Icebreakers требуют обновления:</b>\n"]
         for o in outdated:
             lines.append(
                 f"⚠️ <b>{o['name']}</b> — последний запуск {_format_timedelta(o['idle'])} назад"
             )
-        await callback.message.answer("\n".join(lines), parse_mode="HTML")
+        lines.append("\nНажми кнопку ниже, чтобы обновить.")
+        await callback.message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=icebreaker_update_keyboard(uid),
+        )
     else:
         await callback.message.answer("✅ Все Icebreakers актуальны.")
 
@@ -2328,7 +2334,17 @@ async def cb_check_newsfeed(callback: CallbackQuery):
 
     lines = ["📰 <b>Статус Newsfeed:</b>\n"]
     lines += _newsfeed_report_lines(items)
-    await callback.message.answer("\n".join(lines), parse_mode="HTML")
+
+    has_overdue = any(i["time_left"].total_seconds() <= 0 for i in items)
+    if has_overdue:
+        lines.append("\nНажми кнопку ниже, чтобы обновить просроченные анкеты.")
+        await callback.message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=newsfeed_update_keyboard(user_id),
+        )
+    else:
+        await callback.message.answer("\n".join(lines), parse_mode="HTML")
 
 
 # ======================== CALLBACK: ОБНОВЛЕНИЕ ICEBREAKERS ========================
