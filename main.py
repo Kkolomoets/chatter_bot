@@ -226,6 +226,78 @@ async def api_get(
         return None
 
 
+async def api_post(
+    session: aiohttp.ClientSession, url: str, bearer: str, payload: dict
+) -> Optional[dict]:
+    headers = {
+        **_API_HEADERS_BASE,
+        "Authorization": f"Bearer {bearer}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with session.post(
+            url,
+            headers=headers,
+            json=payload,
+            ssl=False,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status == 400:
+                return {"status": 400}
+            if resp.status != 200:
+                logger.error(f"API POST error {resp.status}: {url}")
+                return None
+            return {"status": 200}
+    except Exception as e:
+        logger.error(f"api_post error: {e}")
+        return None
+
+
+async def get_approved_newsfeed_item(
+    session: aiohttp.ClientSession, bearer: str, profile_id: str
+) -> Optional[dict]:
+    """
+    Возвращает первый APPROVED newsfeed для анкеты:
+    {"id": ..., "type": ...} или None.
+    """
+    url = f"{BASE_URL}/operator/news-feed?profileId=pd-{profile_id}&status=APPROVED&idLast=0"
+    data = await api_get(session, url, bearer)
+    if not data or not isinstance(data, list) or len(data) == 0:
+        return None
+    try:
+        item = data[0]
+        nf_id = item["id"]
+        nf_type = item["content"]["media"][0]["type"]
+        return {"id": nf_id, "type": nf_type}
+    except Exception as e:
+        logger.error(f"get_approved_newsfeed_item parse error: {e}")
+        return None
+
+
+async def send_newsfeed_for_profile(
+    session: aiohttp.ClientSession, bearer: str, profile_id: str
+) -> str:
+    """
+    Обновляет newsfeed для одной анкеты.
+    Возвращает: "ok" | "no_need" | "no_content" | "error"
+    """
+    item = await get_approved_newsfeed_item(session, bearer, profile_id)
+    if item is None:
+        return "no_content"
+    url = f"{BASE_URL}/operator/news-feed"
+    payload = {
+        "profileId": f"pd-{profile_id}",
+        "id": item["id"],
+        "type": item["type"],
+    }
+    result = await api_post(session, url, bearer, payload)
+    if result is None:
+        return "error"
+    if result.get("status") == 400:
+        return "no_need"
+    return "ok"
+
+
 async def api_get_with_refresh(
     http: aiohttp.ClientSession,
     url: str,
@@ -640,6 +712,20 @@ def format_user_alert(user: dict, name_id: dict) -> str:
         f"💬 Сообщений доступно: {user['messagesLeft']}"
         f"{idle}"
         f"\n{important}"
+    )
+
+
+def newsfeed_update_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Кнопка для обновления newsfeed на всех просроченных анкетах."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить NF на всех просроченных",
+                    callback_data=f"nf_update_all_{user_id}",
+                )
+            ]
+        ]
     )
 
 
@@ -1218,15 +1304,29 @@ async def _newsfeed_remind_if_needed(
 
     if new_reminders:
         lines = ["⏰ <b>Напоминание Newsfeed:</b>\n"]
+        has_overdue = False
         for item in new_reminders:
             tl = item["time_left"]
             if tl.total_seconds() <= 0:
                 lines.append(f"🔴 <b>{item['name']}</b> — уже просрочено!")
+                has_overdue = True
             else:
                 lines.append(
                     f"⚠️ <b>{item['name']}</b> — до дедлайна {_format_timedelta(tl)}!"
                 )
-        await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+        # Если есть просроченные — предлагаем обновить одной кнопкой
+        if has_overdue:
+            lines.append(
+                "\nНажми кнопку ниже, чтобы автоматически обновить NF на всех просроченных анкетах."
+            )
+            await bot.send_message(
+                chat_id,
+                "\n".join(lines),
+                parse_mode="HTML",
+                reply_markup=newsfeed_update_keyboard(user_id),
+            )
+        else:
+            await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
 # ======================== BEARER EXPIRY ========================
@@ -1927,6 +2027,85 @@ async def cb_check_newsfeed(callback: CallbackQuery):
 
     lines = ["📰 <b>Статус Newsfeed:</b>\n"]
     lines += _newsfeed_report_lines(items)
+    await callback.message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ======================== CALLBACK: ОБНОВЛЕНИЕ NEWSFEED ========================
+@dp.callback_query(F.data.startswith("nf_update_all_"))
+async def cb_nf_update_all(callback: CallbackQuery):
+    user_id = int(callback.data.split("_")[3])
+    if callback.from_user.id != user_id:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    sess = user_sessions.get(user_id)
+    if not sess:
+        await callback.answer("❌ Нет сессии", show_alert=True)
+        return
+
+    name_id = sess.get("name_id", {})
+    bearer = sess.get("bearer", "")
+
+    if not name_id:
+        await callback.answer("❌ Анкеты не загружены", show_alert=True)
+        return
+
+    await callback.answer("🔄 Обновляю Newsfeed...")
+
+    # Убираем кнопку с сообщения
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    async with aiohttp.ClientSession() as http:
+        items = await fetch_newsfeed_info(http, bearer, name_id)
+
+    # Берём только просроченные
+    overdue = [i for i in items if i["time_left"].total_seconds() <= 0]
+
+    if not overdue:
+        await callback.message.answer(
+            "✅ Просроченных Newsfeed нет — всё уже актуально!"
+        )
+        return
+
+    results_ok = []
+    results_no_need = []
+    results_no_content = []
+    results_error = []
+
+    async with aiohttp.ClientSession() as http:
+        for item in overdue:
+            gid = item["girl_id"]
+            name = item["name"]
+            status = await send_newsfeed_for_profile(http, bearer, gid)
+            if status == "ok":
+                results_ok.append(name)
+            elif status == "no_need":
+                results_no_need.append(name)
+            elif status == "no_content":
+                results_no_content.append(name)
+            else:
+                results_error.append(name)
+            await asyncio.sleep(0.5)
+
+    lines = ["📰 <b>Результат обновления Newsfeed:</b>\n"]
+    for name in results_ok:
+        lines.append(f"✅ <b>{name}</b> — обновлён успешно")
+    for name in results_no_need:
+        lines.append(f"ℹ️ <b>{name}</b> — обновление не требуется")
+    for name in results_no_content:
+        lines.append(f"⚠️ <b>{name}</b> — нет одобренного контента")
+    for name in results_error:
+        lines.append(f"❌ <b>{name}</b> — ошибка запроса")
+
+    # Сбрасываем напоминалки для успешно обновлённых, чтобы не спамить
+    reminded: set = sess.get("newsfeed_reminded", set())
+    for item in overdue:
+        if item["name"] in results_ok:
+            reminded.discard(item["girl_id"])
+    sess["newsfeed_reminded"] = reminded
+
     await callback.message.answer("\n".join(lines), parse_mode="HTML")
 
 
