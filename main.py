@@ -42,11 +42,10 @@ BEARER_MIN_REFRESH_INTERVAL = timedelta(hours=1)
 # Newsfeed: длина смены и порог — предупреждаем если до дедлайна < 8 ч (смена)
 NEWSFEED_INTERVAL = timedelta(hours=12)
 SHIFT_DURATION = timedelta(hours=8)
-NEWSFEED_WARN_BEFORE = timedelta(minutes=0)  # уведомлять когда истекло
-NEWSFEED_CHECK_INTERVAL = 30  # секунд между проверками newsfeed
+NEWSFEED_WARN_BEFORE = timedelta(minutes=30)  # предупреждать за 30 мин до дедлайна
 
-IB_INTERVAL = timedelta(hours=6)  # icebreakers: порог устаревания
-IB_CHECK_INTERVAL = 30 * 60  # секунд между проверками icebreakers (30 мин)
+IB_INTERVAL = timedelta(hours=6)  # icebreakers: интервал обновления
+IB_WARN_BEFORE = timedelta(minutes=30)  # предупреждать за 30 мин до дедлайна IB
 
 DEDUP_WINDOW = timedelta(minutes=8)  # антидубль: не повторять пару (girl_id, user_id)
 SNOOZE_OPTIONS = [  # варианты игнора (секунды, метка)
@@ -224,6 +223,206 @@ async def api_get(
     except Exception as e:
         logger.error(f"Request error: {e}")
         return None
+
+
+async def api_post(
+    session: aiohttp.ClientSession, url: str, bearer: str, payload: dict
+) -> Optional[dict]:
+    headers = {
+        **_API_HEADERS_BASE,
+        "Authorization": f"Bearer {bearer}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with session.post(
+            url,
+            headers=headers,
+            json=payload,
+            ssl=False,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status == 400:
+                return {"status": 400}
+            if resp.status != 200:
+                logger.error(f"API POST error {resp.status}: {url}")
+                return None
+            return {"status": 200}
+    except Exception as e:
+        logger.error(f"api_post error: {e}")
+        return None
+
+
+async def get_approved_newsfeed_item(
+    session: aiohttp.ClientSession, bearer: str, profile_id: str
+) -> Optional[dict]:
+    """
+    Возвращает первый APPROVED newsfeed для анкеты:
+    {"id": ..., "type": ...} или None.
+    """
+    url = f"{BASE_URL}/operator/news-feed?profileId=pd-{profile_id}&status=APPROVED&idLast=0"
+    data = await api_get(session, url, bearer)
+    if not data or not isinstance(data, list) or len(data) == 0:
+        return None
+    try:
+        item = data[0]
+        nf_id = item["id"]
+        nf_type = item["content"]["media"][0]["type"]
+        return {"id": nf_id, "type": nf_type}
+    except Exception as e:
+        logger.error(f"get_approved_newsfeed_item parse error: {e}")
+        return None
+
+
+async def get_approved_icebreaker_mail(
+    session: aiohttp.ClientSession, bearer: str, profile_id: str
+) -> Optional[int]:
+    """
+    GET /scheduler/icebreakers/approved?type=MAIL
+    Возвращает id последнего добавленного mail-айсбрейкера (первый в списке)
+    или None если список пуст.
+    Фильтрация по status не нужна — у mail moods всегда пустые.
+    """
+    url = f"{BASE_URL}/scheduler/icebreakers/approved?profileId=pd-{profile_id}&cursor=&type=MAIL"
+    data = await api_get(session, url, bearer)
+    if not data or not isinstance(data, dict):
+        return None
+    items = data.get("items", [])
+    if not items:
+        logger.info(f"get_approved_icebreaker_mail: no mail items for {profile_id}")
+        return None
+    # Список отсортирован по dateCreated убыванию — первый = последний добавленный
+    return items[0]["id"]
+
+
+MOOD_PRIORITY = ["real_love", "friendship", "hot_talks"]
+
+
+async def get_approved_icebreaker_messages(
+    session: aiohttp.ClientSession, bearer: str, profile_id: str
+) -> Optional[list]:
+    """
+    GET /scheduler/icebreakers/approved?type=MESSAGE
+    Возвращает список из трёх элементов для POST:
+    [{"idIcebreaker": id, "mood": "real_love"}, {"idIcebreaker": id, "mood": "friendship"}, {"idIcebreaker": id, "mood": "hot_talks"}]
+
+    Логика выбора:
+    - Для каждой категории берём первый (последний добавленный) item,
+      у которого эта категория имеет status == "approved".
+    - Один item может закрыть несколько категорий, но используется только
+      в одну (приоритет: real_love → friendship → hot_talks).
+    - Если для какой-то категории не нашлось подходящего — возвращаем None.
+    """
+    url = f"{BASE_URL}/scheduler/icebreakers/approved?profileId=pd-{profile_id}&cursor=&type=MESSAGE"
+    data = await api_get(session, url, bearer)
+    if not data or not isinstance(data, dict):
+        return None
+    items = data.get("items", [])
+    if not items:
+        logger.info(
+            f"get_approved_icebreaker_messages: no message items for {profile_id}"
+        )
+        return None
+
+    assigned: dict[str, int] = {}  # mood -> item_id
+    used_ids: set[int] = set()  # id'шники уже назначенных items
+
+    for mood in MOOD_PRIORITY:
+        for item in items:
+            item_id = item.get("id")
+            if item_id in used_ids:
+                continue
+            moods = item.get("moods", [])
+            # Проверяем что у этого item есть данная категория со статусом approved
+            approved_for_mood = any(
+                m.get("code") == mood and m.get("status") == "approved" for m in moods
+            )
+            if approved_for_mood:
+                assigned[mood] = item_id
+                used_ids.add(item_id)
+                break
+
+    missing = [m for m in MOOD_PRIORITY if m not in assigned]
+    if missing:
+        logger.warning(
+            f"get_approved_icebreaker_messages: no approved item for moods {missing} "
+            f"on profile {profile_id}"
+        )
+        return None
+
+    return [{"idIcebreaker": assigned[m], "mood": m} for m in MOOD_PRIORITY]
+
+
+async def send_newsfeed_for_profile(
+    session: aiohttp.ClientSession, bearer: str, profile_id: str
+) -> str:
+    """
+    Обновляет newsfeed для одной анкеты.
+    Возвращает: "ok" | "no_need" | "no_content" | "error"
+    """
+    item = await get_approved_newsfeed_item(session, bearer, profile_id)
+    if item is None:
+        return "no_content"
+    url = f"{BASE_URL}/operator/news-feed"
+    payload = {
+        "profileId": f"pd-{profile_id}",
+        "id": item["id"],
+        "type": item["type"],
+    }
+    result = await api_post(session, url, bearer, payload)
+    if result is None:
+        return "error"
+    if result.get("status") == 400:
+        return "no_need"
+    return "ok"
+
+
+async def send_icebreaker_mail(
+    session: aiohttp.ClientSession, bearer: str, profile_id: str
+) -> str:
+    """
+    Отправляет icebreaker mail для анкеты.
+    POST /scheduler/icebreakers/send
+    Возвращает: "ok" | "no_content" | "error"
+    """
+    item_id = await get_approved_icebreaker_mail(session, bearer, profile_id)
+    if item_id is None:
+        return "no_content"
+    url = f"{BASE_URL}/scheduler/icebreakers/send"
+    payload = {
+        "profileId": f"pd-{profile_id}",
+        "itemId": item_id,
+        "itemType": "mail",
+    }
+    result = await api_post(session, url, bearer, payload)
+    if result is None:
+        return "error"
+    if result.get("status") == 400:
+        return "no_need"
+    return "ok"
+
+
+async def send_icebreaker_messages(
+    session: aiohttp.ClientSession, bearer: str, profile_id: str
+) -> str:
+    """
+    Создаёт группу icebreaker messages для анкеты.
+    POST /scheduler/icebreakers/group/create
+    Возвращает: "ok" | "no_content" | "error"
+    """
+    icebreakers = await get_approved_icebreaker_messages(session, bearer, profile_id)
+    if icebreakers is None:
+        return "no_content"
+    url = f"{BASE_URL}/scheduler/icebreakers/group/create"
+    payload = {
+        "profileId": f"pd-{profile_id}",
+        "icebreakers": icebreakers,
+    }
+    result = await api_post(session, url, bearer, payload)
+    if result is None:
+        return "error"
+    if result.get("status") == 400:
+        return "no_need"
+    return "ok"
 
 
 async def api_get_with_refresh(
@@ -643,6 +842,34 @@ def format_user_alert(user: dict, name_id: dict) -> str:
     )
 
 
+def icebreaker_update_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Кнопка для обновления icebreakers на всех устаревших анкетах."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить IB на всех устаревших",
+                    callback_data=f"ib_update_all_{user_id}",
+                )
+            ]
+        ]
+    )
+
+
+def newsfeed_update_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Кнопка для обновления newsfeed на всех просроченных анкетах."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить NF на всех просроченных",
+                    callback_data=f"nf_update_all_{user_id}",
+                )
+            ]
+        ]
+    )
+
+
 def snooze_keyboard(girl_id: str, user_id: str) -> InlineKeyboardMarkup:
     """Маленькая строка кнопок игнора под обычным (не важным) уведомлением."""
     buttons = [
@@ -908,13 +1135,13 @@ async def monitoring_task(user_id: int, chat_id: int):
             parse_mode="HTML",
         )
 
-        # --- Newsfeed: проверяем при старте ---
-        await _check_and_notify_newsfeed(session, user_id, chat_id, startup=True)
+        # --- Newsfeed: проверяем при старте, запоминаем дедлайны ---
+        nf_deadlines = await _init_newsfeed_schedule(session, user_id, chat_id)
         session_data["newsfeed_reminded"] = set()
-        session_data["ib_notified"] = set()
 
-        # --- Icebreakers: проверяем при старте ---
-        await _check_and_notify_icebreakers(session, user_id, chat_id)
+        # --- Icebreakers: проверяем при старте, запоминаем дедлайны ---
+        ib_deadlines = await _init_ib_schedule(session, user_id, chat_id)
+        session_data["ib_notified"] = set()
 
         # --- Bearer: проверяем при старте нужно ли скоро обновить ---
         await _check_bearer_expiry(session, user_id, chat_id)
@@ -928,17 +1155,12 @@ async def monitoring_task(user_id: int, chat_id: int):
         )
         next_message_check = asyncio.get_event_loop().time() + message_interval
 
-        # Newsfeed проверяем каждые 30 секунд
-        next_newsfeed_check = asyncio.get_event_loop().time() + 30
-
-        # Icebreakers проверяем каждые 30 минут
-        next_ib_check = asyncio.get_event_loop().time() + IB_CHECK_INTERVAL
-
         # Bearer expiry проверяем каждые 10 минут
         next_bearer_check = asyncio.get_event_loop().time() + 600
 
         while session_data.get("running", False):
             now = asyncio.get_event_loop().time()
+            now_utc = _now_utc()
             multiplier = session_data.get("interval_multiplier", 1.0)
             mon = session_data.get("monitors", DEFAULT_MONITORS.copy())
             # Всегда берём актуальный bearer из сессии (мог обновиться)
@@ -1042,15 +1264,15 @@ async def monitoring_task(user_id: int, chat_id: int):
                         )
                 next_message_check += message_interval * multiplier
 
-            # Проверка newsfeed (когда истекло)
-            if now >= next_newsfeed_check:
-                await _newsfeed_remind_if_needed(session, user_id, chat_id)
-                next_newsfeed_check = now + 30
+            # Newsfeed: проверяем по дедлайнам
+            nf_deadlines = await _tick_newsfeed_schedule(
+                session, user_id, chat_id, nf_deadlines
+            )
 
-            # Проверка icebreakers каждые 30 минут
-            if now >= next_ib_check:
-                await _check_and_notify_icebreakers(session, user_id, chat_id)
-                next_ib_check = now + IB_CHECK_INTERVAL
+            # Icebreakers: проверяем по дедлайнам
+            ib_deadlines = await _tick_ib_schedule(
+                session, user_id, chat_id, ib_deadlines
+            )
 
             # Проверка Bearer на истечение
             if now >= next_bearer_check:
@@ -1111,6 +1333,136 @@ async def check_icebreakers_outdated(
     return outdated
 
 
+async def get_icebreakers_latest(
+    session: aiohttp.ClientSession, bearer: str, list_of_id: list
+) -> dict:
+    """
+    Возвращает {girl_id: datetime} — время последнего запуска IB для каждой анкеты.
+    Анкеты без данных пропускаются.
+    """
+    result = {}
+    for girl_id in list_of_id:
+        items = await get_icebreakers(session, bearer, girl_id)
+        latest = None
+        for item in items:
+            try:
+                dt = _parse_newsfeed_dt(item["dateLastLaunched"])
+                if latest is None or dt > latest:
+                    latest = dt
+            except Exception:
+                pass
+        if latest is not None:
+            result[girl_id] = latest
+        await asyncio.sleep(0.3)
+    return result
+
+
+async def _init_ib_schedule(
+    session: aiohttp.ClientSession, user_id: int, chat_id: int
+) -> dict:
+    """
+    Вызывается при старте мониторинга.
+    Получает дедлайны IB для каждой анкеты, отправляет стартовый отчёт.
+    Возвращает {girl_id: {"warn": datetime|None, "expire": datetime}}
+    """
+    sess = user_sessions.get(user_id, {})
+    list_of_id = sess.get("list_of_id", [])
+    name_id = sess.get("name_id", {})
+    bearer = sess.get("bearer", "")
+
+    outdated = await check_icebreakers_outdated(session, bearer, list_of_id, name_id)
+    outdated_ids = {o["girl_id"] for o in outdated}
+    sess["ib_outdated_ids"] = list(outdated_ids)
+
+    now = _now_utc()
+    deadlines = {}
+
+    # Для устаревших — дедлайн уже прошёл, пишем сразу
+    if outdated:
+        lines = ["🧊 <b>Icebreakers устарели при старте:</b>\n"]
+        for o in outdated:
+            lines.append(
+                f"⚠️ <b>{o['name']}</b> — последний запуск {_format_timedelta(o['idle'])} назад"
+            )
+            # Следующий дедлайн — через IB_INTERVAL от сейчас
+            deadlines[o["girl_id"]] = {
+                "warn": now + IB_INTERVAL - IB_WARN_BEFORE,
+                "expire": now + IB_INTERVAL,
+            }
+        lines.append("\nНажми кнопку ниже, чтобы обновить.")
+        await bot.send_message(
+            chat_id,
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=icebreaker_update_keyboard(user_id),
+        )
+        sess["ib_notified"] = outdated_ids.copy()
+    else:
+        await bot.send_message(
+            chat_id, "🧊 <b>Icebreakers:</b> все анкеты актуальны.", parse_mode="HTML"
+        )
+
+    # Для актуальных — вычисляем дедлайн из реального времени последнего запуска
+    items_raw = await get_icebreakers_latest(session, bearer, list_of_id)
+    for gid, latest_dt in items_raw.items():
+        if gid in deadlines:
+            continue  # уже обработали выше
+        expire = latest_dt + IB_INTERVAL
+        warn = expire - IB_WARN_BEFORE
+        deadlines[gid] = {"warn": warn if warn > now else None, "expire": expire}
+
+    return deadlines
+
+
+async def _tick_ib_schedule(
+    session: aiohttp.ClientSession, user_id: int, chat_id: int, deadlines: dict
+) -> dict:
+    """
+    Вызывается в каждой итерации цикла.
+    Проверяет дедлайны IB и отправляет уведомления точно вовремя.
+    """
+    sess = user_sessions.get(user_id, {})
+    name_id = sess.get("name_id", {})
+    now = _now_utc()
+
+    warn_items = []
+    expire_items = []
+
+    for gid, schedule in list(deadlines.items()):
+        name = name_id.get(gid, gid)
+
+        if schedule["warn"] is not None and now >= schedule["warn"]:
+            tl = schedule["expire"] - now
+            warn_items.append((name, tl))
+            deadlines[gid]["warn"] = None
+
+        if now >= schedule["expire"]:
+            expire_items.append((gid, name))
+            deadlines[gid]["expire"] = now + IB_INTERVAL
+            deadlines[gid]["warn"] = now + IB_INTERVAL - IB_WARN_BEFORE
+
+    if warn_items:
+        lines = ["⏰ <b>Icebreakers — скоро устареют:</b>\n"]
+        for name, tl in warn_items:
+            lines.append(f"⚠️ <b>{name}</b> — через {_format_timedelta(tl)}")
+        await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+
+    if expire_items:
+        sess["ib_outdated_ids"] = [gid for gid, _ in expire_items]
+        lines = ["🧊 <b>Icebreakers устарели:</b>\n"]
+        for _, name in expire_items:
+            lines.append(f"⚠️ <b>{name}</b> — нужно обновить!")
+        lines.append("\nНажми кнопку ниже, чтобы обновить.")
+        await bot.send_message(
+            chat_id,
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=icebreaker_update_keyboard(user_id),
+        )
+
+    return deadlines
+
+
 async def _check_and_notify_icebreakers(
     session: aiohttp.ClientSession, user_id: int, chat_id: int
 ):
@@ -1131,6 +1483,9 @@ async def _check_and_notify_icebreakers(
     ib_notified &= current_outdated_ids
     sess["ib_notified"] = ib_notified
 
+    # Сохраняем текущий список устаревших для использования в callback
+    sess["ib_outdated_ids"] = [o["girl_id"] for o in outdated]
+
     if new_outdated:
         lines = ["🧊 <b>Icebreakers требуют обновления:</b>\n"]
         for o in new_outdated:
@@ -1139,97 +1494,143 @@ async def _check_and_notify_icebreakers(
             )
             ib_notified.add(o["girl_id"])
         sess["ib_notified"] = ib_notified
-        await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+        lines.append(
+            "\nНажми кнопку ниже, чтобы автоматически обновить IB на всех устаревших анкетах."
+        )
+        await bot.send_message(
+            chat_id,
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=icebreaker_update_keyboard(user_id),
+        )
 
 
 # ======================== NEWSFEED ЛОГИКА ========================
-async def _check_and_notify_newsfeed(
-    session: aiohttp.ClientSession,
-    user_id: int,
-    chat_id: int,
-    startup: bool = False,
-):
-    """
-    При startup=True — пишем полный отчёт: только анкеты, у которых
-    дедлайн наступит в пределах текущей смены (< 8ч), и просроченные.
-    Остальные — молча, они не актуальны для этой смены.
-    """
-    sess = user_sessions.get(user_id, {})
-    name_id = sess.get("name_id", {})
-    bearer = sess.get("bearer", "")
-
-    items = await fetch_newsfeed_info(session, bearer, name_id)
-    if not items:
-        return
-
-    urgent = [i for i in items if i["time_left"] <= SHIFT_DURATION]
-    overdue = [i for i in urgent if i["time_left"].total_seconds() <= 0]
-    soon = [i for i in urgent if i["time_left"].total_seconds() > 0]
-
-    if not urgent:
-        if startup:
-            await bot.send_message(
-                chat_id,
-                "📰 <b>Newsfeed:</b> все анкеты в порядке, в этой смене обновлять не нужно.",
-                parse_mode="HTML",
-            )
-        return
-
-    lines = ["📰 <b>Newsfeed — требует внимания в эту смену:</b>\n"]
-    for item in overdue:
-        lines.append(f"🔴 <b>{item['name']}</b> — просрочено! Нужно обновить сейчас.")
-    for item in soon:
-        lines.append(
-            f"⚠️ <b>{item['name']}</b> — через {_format_timedelta(item['time_left'])}"
-            f" (до {item['deadline'].strftime('%H:%M')} UTC)"
-        )
-
-    await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
-
-
-async def _newsfeed_remind_if_needed(
+async def _init_newsfeed_schedule(
     session: aiohttp.ClientSession, user_id: int, chat_id: int
-):
+) -> dict:
     """
-    Проверяет newsfeed и отправляет напоминание за NEWSFEED_WARN_BEFORE (15 мин)
-    до дедлайна. Каждой анкете — не более одного напоминания за цикл.
+    Вызывается при старте мониторинга.
+    Получает актуальные дедлайны NF для каждой анкеты,
+    отправляет стартовый отчёт и возвращает словарь дедлайнов:
+    {girl_id: {"warn": datetime|None, "expire": datetime}}
+    warn = None если предупреждение уже отправлено (осталось < 30 мин).
     """
     sess = user_sessions.get(user_id, {})
     name_id = sess.get("name_id", {})
     bearer = sess.get("bearer", "")
-    reminded: set = sess.get("newsfeed_reminded", set())
 
     items = await fetch_newsfeed_info(session, bearer, name_id)
-    new_reminders = []
+    now = _now_utc()
+    deadlines = {}
+
+    urgent_lines = []
+    warn_lines = []
 
     for item in items:
         gid = item["girl_id"]
+        deadline = item["deadline"]
         tl = item["time_left"]
-        # Напоминаем если осталось меньше NEWSFEED_WARN_BEFORE и ещё не напоминали
-        if timedelta(0) < tl <= NEWSFEED_WARN_BEFORE and gid not in reminded:
-            new_reminders.append(item)
-            reminded.add(gid)
-        # Если уже просрочено и не напоминали — тоже предупреждаем
-        elif tl.total_seconds() <= 0 and gid not in reminded:
-            new_reminders.append(item)
-            reminded.add(gid)
+        warn_at = deadline - NEWSFEED_WARN_BEFORE
 
-    sess["newsfeed_reminded"] = reminded
+        if tl.total_seconds() <= 0:
+            # Уже просрочено — пишем сразу, warn пропускаем
+            urgent_lines.append(
+                f"🔴 <b>{item['name']}</b> — просрочено! Нужно обновить сейчас."
+            )
+            deadlines[gid] = {"warn": None, "expire": deadline + NEWSFEED_INTERVAL}
+        elif tl <= NEWSFEED_WARN_BEFORE:
+            # Меньше 30 мин — сразу в предупреждение, warn уже не нужен
+            warn_lines.append(
+                f"⚠️ <b>{item['name']}</b> — через {_format_timedelta(tl)}"
+                f" (до {deadline.strftime('%H:%M')} UTC)"
+            )
+            deadlines[gid] = {"warn": None, "expire": deadline}
+        else:
+            deadlines[gid] = {"warn": warn_at, "expire": deadline}
 
-    if new_reminders:
-        lines = ["⏰ <b>Напоминание Newsfeed:</b>\n"]
-        for item in new_reminders:
-            tl = item["time_left"]
-            if tl.total_seconds() <= 0:
-                lines.append(f"🔴 <b>{item['name']}</b> — уже просрочено!")
-            else:
-                lines.append(
-                    f"⚠️ <b>{item['name']}</b> — до дедлайна {_format_timedelta(tl)}!"
-                )
+    # Стартовый отчёт
+    if urgent_lines:
+        lines = ["📰 <b>Newsfeed — просрочено при старте:</b>\n"] + urgent_lines
+        lines.append("\nНажми кнопку ниже, чтобы обновить.")
+        await bot.send_message(
+            chat_id,
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=newsfeed_update_keyboard(user_id),
+        )
+    if warn_lines:
+        lines = ["📰 <b>Newsfeed — скоро истекает:</b>\n"] + warn_lines
+        await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+    if not urgent_lines and not warn_lines:
+        await bot.send_message(
+            chat_id,
+            "📰 <b>Newsfeed:</b> все анкеты в порядке, в этой смене обновлять не нужно.",
+            parse_mode="HTML",
+        )
+
+    return deadlines
+
+
+async def _tick_newsfeed_schedule(
+    session: aiohttp.ClientSession, user_id: int, chat_id: int, deadlines: dict
+) -> dict:
+    """
+    Вызывается в каждой итерации цикла.
+    Проверяет дедлайны и отправляет уведомления точно вовремя.
+    Возвращает обновлённый словарь дедлайнов.
+    """
+    sess = user_sessions.get(user_id, {})
+    name_id = sess.get("name_id", {})
+    bearer = sess.get("bearer", "")
+    now = _now_utc()
+
+    warn_items = []
+    expire_items = []
+
+    for gid, schedule in list(deadlines.items()):
+        name = name_id.get(gid, gid)
+
+        # Проверка предупреждения (за 30 мин)
+        if schedule["warn"] is not None and now >= schedule["warn"]:
+            tl = schedule["expire"] - now
+            warn_items.append((name, tl, schedule["expire"]))
+            deadlines[gid]["warn"] = None  # больше не повторять
+
+        # Проверка истечения
+        if now >= schedule["expire"]:
+            expire_items.append((gid, name))
+            # Планируем следующий дедлайн — получим точное время после реального обновления
+            deadlines[gid]["expire"] = now + NEWSFEED_INTERVAL
+            deadlines[gid]["warn"] = now + NEWSFEED_INTERVAL - NEWSFEED_WARN_BEFORE
+
+    if warn_items:
+        lines = ["⏰ <b>Newsfeed — скоро истекает:</b>\n"]
+        for name, tl, deadline in warn_items:
+            lines.append(
+                f"⚠️ <b>{name}</b> — через {_format_timedelta(tl)}"
+                f" (до {deadline.strftime('%H:%M')} UTC)"
+            )
         await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
+    if expire_items:
+        # Сохраняем список просроченных для кнопки
+        sess["nf_overdue_ids"] = [gid for gid, _ in expire_items]
+        lines = ["🔴 <b>Newsfeed просрочен:</b>\n"]
+        for _, name in expire_items:
+            lines.append(f"🔴 <b>{name}</b> — нужно обновить!")
+        lines.append("\nНажми кнопку ниже, чтобы обновить.")
+        await bot.send_message(
+            chat_id,
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=newsfeed_update_keyboard(user_id),
+        )
 
-# ======================== BEARER EXPIRY ========================
+    return deadlines
+
+
+# ======================== ICEBREAKERS ========================
 async def _check_bearer_expiry(
     session: aiohttp.ClientSession, user_id: int, chat_id: int
 ):
@@ -1927,6 +2328,170 @@ async def cb_check_newsfeed(callback: CallbackQuery):
 
     lines = ["📰 <b>Статус Newsfeed:</b>\n"]
     lines += _newsfeed_report_lines(items)
+    await callback.message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ======================== CALLBACK: ОБНОВЛЕНИЕ ICEBREAKERS ========================
+@dp.callback_query(F.data.startswith("ib_update_all_"))
+async def cb_ib_update_all(callback: CallbackQuery):
+    user_id = int(callback.data.split("_")[3])
+    if callback.from_user.id != user_id:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    sess = user_sessions.get(user_id)
+    if not sess:
+        await callback.answer("❌ Нет сессии", show_alert=True)
+        return
+
+    name_id = sess.get("name_id", {})
+    bearer = sess.get("bearer", "")
+    outdated_ids = sess.get("ib_outdated_ids", [])
+
+    if not outdated_ids:
+        await callback.answer("✅ Устаревших icebreakers нет", show_alert=True)
+        return
+
+    await callback.answer("🔄 Обновляю Icebreakers...")
+
+    # Убираем кнопку с сообщения
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    ok_mail, ok_msg = [], []
+    fail_mail, fail_msg = [], []
+    no_content_mail, no_content_msg = [], []
+
+    async with aiohttp.ClientSession() as http:
+        for gid in outdated_ids:
+            name = name_id.get(gid, gid)
+
+            mail_status = await send_icebreaker_mail(http, bearer, gid)
+            if mail_status == "ok":
+                ok_mail.append(name)
+            elif mail_status == "no_content":
+                no_content_mail.append(name)
+            else:
+                fail_mail.append(name)
+
+            await asyncio.sleep(0.3)
+
+            msg_status = await send_icebreaker_messages(http, bearer, gid)
+            if msg_status == "ok":
+                ok_msg.append(name)
+            elif msg_status == "no_content":
+                no_content_msg.append(name)
+            else:
+                fail_msg.append(name)
+
+            await asyncio.sleep(0.5)
+
+    lines = ["🧊 <b>Результат обновления Icebreakers:</b>\n"]
+
+    lines.append("<b>📧 Mail:</b>")
+    for name in ok_mail:
+        lines.append(f"  ✅ {name}")
+    for name in no_content_mail:
+        lines.append(f"  ⚠️ {name} — нет одобренного контента")
+    for name in fail_mail:
+        lines.append(f"  ❌ {name} — ошибка запроса")
+
+    lines.append("\n<b>💬 Messages:</b>")
+    for name in ok_msg:
+        lines.append(f"  ✅ {name}")
+    for name in no_content_msg:
+        lines.append(f"  ⚠️ {name} — нет одобренного контента")
+    for name in fail_msg:
+        lines.append(f"  ❌ {name} — ошибка запроса")
+
+    # Сбрасываем notified для успешно обновлённых
+    ib_notified: set = sess.get("ib_notified", set())
+    for gid in outdated_ids:
+        name = name_id.get(gid, gid)
+        if name in ok_mail and name in ok_msg:
+            ib_notified.discard(gid)
+    sess["ib_notified"] = ib_notified
+
+    await callback.message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ======================== CALLBACK: ОБНОВЛЕНИЕ NEWSFEED ========================
+@dp.callback_query(F.data.startswith("nf_update_all_"))
+async def cb_nf_update_all(callback: CallbackQuery):
+    user_id = int(callback.data.split("_")[3])
+    if callback.from_user.id != user_id:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    sess = user_sessions.get(user_id)
+    if not sess:
+        await callback.answer("❌ Нет сессии", show_alert=True)
+        return
+
+    name_id = sess.get("name_id", {})
+    bearer = sess.get("bearer", "")
+
+    if not name_id:
+        await callback.answer("❌ Анкеты не загружены", show_alert=True)
+        return
+
+    await callback.answer("🔄 Обновляю Newsfeed...")
+
+    # Убираем кнопку с сообщения
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    async with aiohttp.ClientSession() as http:
+        items = await fetch_newsfeed_info(http, bearer, name_id)
+
+    # Берём только просроченные
+    overdue = [i for i in items if i["time_left"].total_seconds() <= 0]
+
+    if not overdue:
+        await callback.message.answer(
+            "✅ Просроченных Newsfeed нет — всё уже актуально!"
+        )
+        return
+
+    results_ok = []
+    results_no_need = []
+    results_no_content = []
+    results_error = []
+
+    async with aiohttp.ClientSession() as http:
+        for item in overdue:
+            gid = item["girl_id"]
+            name = item["name"]
+            status = await send_newsfeed_for_profile(http, bearer, gid)
+            if status == "ok":
+                results_ok.append(name)
+            elif status == "no_need":
+                results_no_need.append(name)
+            elif status == "no_content":
+                results_no_content.append(name)
+            else:
+                results_error.append(name)
+            await asyncio.sleep(0.5)
+
+    lines = ["📰 <b>Результат обновления Newsfeed:</b>\n"]
+    for name in results_ok:
+        lines.append(f"✅ <b>{name}</b> — обновлён успешно")
+    for name in results_no_need:
+        lines.append(f"ℹ️ <b>{name}</b> — обновление не требуется")
+    for name in results_no_content:
+        lines.append(f"⚠️ <b>{name}</b> — нет одобренного контента")
+    for name in results_error:
+        lines.append(f"❌ <b>{name}</b> — ошибка запроса")
+
+    # Сбрасываем напоминалки для успешно обновлённых, чтобы не спамить
+    reminded: set = sess.get("newsfeed_reminded", set())
+    for item in overdue:
+        if item["name"] in results_ok:
+            reminded.discard(item["girl_id"])
+    sess["newsfeed_reminded"] = reminded
+
     await callback.message.answer("\n".join(lines), parse_mode="HTML")
 
 
