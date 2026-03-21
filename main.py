@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ======================== НАСТРОЙКИ ========================
-BOT_TOKEN = getenv("TEST_BOT_TOKEN")
+BOT_TOKEN = getenv("BOT_TOKEN")
 ADMIN_IDS = [970941850]
 SESSIONS_FILE = "sessions.json"
 
